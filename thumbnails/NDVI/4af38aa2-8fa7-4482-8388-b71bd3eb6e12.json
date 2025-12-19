@@ -1,0 +1,18 @@
+{
+  "land_id": "4af38aa2-8fa7-4482-8388-b71bd3eb6e12",
+  "crs": "EPSG:4326",
+  "bounds": {
+    "north": 1865460.0,
+    "south": 1865360.0,
+    "east": 413760.0,
+    "west": 413620.0
+  },
+  "ndvi_range": {
+    "min": -0.2,
+    "max": 0.9
+  },
+  "resolution": {
+    "width": 14,
+    "height": 10
+  }
+}
