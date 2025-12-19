@@ -1,34 +1,38 @@
 from datetime import date, datetime, UTC
-from typing import Dict
-from db import fetch_lands
-
+from typing import Dict, List
 
 from db import (
     fetch_lands,
     insert_ndvi,
-    update_land,
-    log_step,
+    update_land_ndvi_snapshot,
+    mark_land_ndvi_failed,
+    log_ndvi_step,
 )
+
 from processor import process_land
 from analysis import crop_health
 from logger import logger
 
 
+# --------------------------------------------------
+# Build NDVI time-series row
+# --------------------------------------------------
 def build_ndvi_row(
+    *,
     land: Dict,
     result: Dict,
     health_label: str,
-    alerts: list[str],
+    alerts: List[str],
 ) -> Dict:
 
     return {
         "land_id": land["id"],
         "tenant_id": land["tenant_id"],
 
-        # ✅ DATE (NOT datetime)
+        # DATE ONLY (schema-aligned)
         "date": date.today().isoformat(),
 
-        # Core NDVI
+        # NDVI metrics
         "ndvi_value": round(result["ndvi_mean"], 3),
         "min_ndvi": round(result["ndvi_min"], 3),
         "max_ndvi": round(result["ndvi_max"], 3),
@@ -36,16 +40,16 @@ def build_ndvi_row(
         # Water stress
         "ndwi_value": round(result["ndwi_mean"], 3),
 
-        # Sentinel-1 soil moisture (nullable)
-        "soil_moisture": result["soil_moisture"],
+        # SAR soil moisture (nullable)
+        "soil_moisture": result.get("soil_moisture"),
 
-        # Image
-        "image_url": result["ndvi_thumbnail_url"],
+        # Thumbnail
+        "image_url": result.get("ndvi_thumbnail_url"),
 
-        # Metadata (analytics-only)
+        # Analytics metadata
         "metadata": {
             "ndvi_trend": round(result["ndvi_trend"], 4),
-            "ndre_trend": round(result["ndre_trend"], 4),
+            "ndre_trend": round(result.get("ndre_trend", 0.0), 4),
             "health_label": health_label,
             "alerts": alerts,
             "valid_observations": result["valid_observations"],
@@ -59,6 +63,10 @@ def build_ndvi_row(
         "spatial_resolution": 10,
     }
 
+
+# --------------------------------------------------
+# Main pipeline
+# --------------------------------------------------
 def main():
     logger.info("NDVI pipeline started")
 
@@ -71,16 +79,18 @@ def main():
     for land in lands:
         land_id = land["id"]
         tenant_id = land["tenant_id"]
+        start_time = datetime.now(UTC)
 
         try:
             # --------------------------------------------------
-            # LOG: START
+            # LOG: PROCESS START
             # --------------------------------------------------
-            log_step(
-                step="PROCESS_START",
-                status="running",
-                land_id=land_id,
+            log_ndvi_step(
+                processing_step="PROCESS_START",
+                step_status="started",
                 tenant_id=tenant_id,
+                land_id=land_id,
+                started_at=start_time,
             )
 
             # --------------------------------------------------
@@ -89,11 +99,12 @@ def main():
             result = process_land(land)
 
             if result is None:
-                log_step(
-                    step="PROCESS_SKIPPED",
-                    status="no_data",
-                    land_id=land_id,
+                log_ndvi_step(
+                    processing_step="PROCESS_SKIPPED",
+                    step_status="skipped",
                     tenant_id=tenant_id,
+                    land_id=land_id,
+                    started_at=start_time,
                 )
                 continue
 
@@ -108,9 +119,8 @@ def main():
                 soil_moisture=result.get("soil_moisture"),
             )
 
-
             # --------------------------------------------------
-            # INSERT NDVI DATA
+            # INSERT NDVI TIME-SERIES
             # --------------------------------------------------
             ndvi_row = build_ndvi_row(
                 land=land,
@@ -122,33 +132,38 @@ def main():
             insert_ndvi(ndvi_row)
 
             # --------------------------------------------------
-            # UPDATE LANDS TABLE
+            # UPDATE LAND SNAPSHOT
             # --------------------------------------------------
-            update_land(
+            update_land_ndvi_snapshot(
                 land_id=land_id,
-                ndvi=result["ndvi_mean"],
-                thumbnail_url=result["ndvi_thumbnail_url"],
+                ndvi_value=result["ndvi_mean"],
+                ndvi_date=date.today(),
+                thumbnail_url=result.get("ndvi_thumbnail_url"),
             )
 
             # --------------------------------------------------
             # LOG: SUCCESS
             # --------------------------------------------------
-            log_step(
-                step="PROCESS_END",
-                status="success",
-                land_id=land_id,
+            log_ndvi_step(
+                processing_step="PROCESS_END",
+                step_status="completed",
                 tenant_id=tenant_id,
+                land_id=land_id,
+                started_at=start_time,
             )
 
         except Exception as e:
             logger.exception(f"Land processing failed: {land_id}")
 
-            log_step(
-                step="PROCESS_ERROR",
-                status="error",
-                land_id=land_id,
+            mark_land_ndvi_failed(land_id=land_id)
+
+            log_ndvi_step(
+                processing_step="PROCESS_ERROR",
+                step_status="failed",
                 tenant_id=tenant_id,
-                error=str(e),
+                land_id=land_id,
+                started_at=start_time,
+                error_message=str(e),
             )
 
     logger.info("NDVI pipeline finished")
