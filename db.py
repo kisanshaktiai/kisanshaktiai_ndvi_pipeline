@@ -109,7 +109,7 @@ def update_land_ndvi_snapshot(
             .update(
                 {
                     "last_ndvi_value": round(ndvi_value, 3),
-                    "last_ndvi_calculation": ndvi_date,
+                    "last_ndvi_calculation": ndvi_date.isoformat(),
                     "ndvi_thumbnail_url": thumbnail_url,
                     "ndvi_tested": True,
                     "ndvi_status": "completed",
