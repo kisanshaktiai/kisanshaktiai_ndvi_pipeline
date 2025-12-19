@@ -6,3 +6,4 @@ shapely
 numpy
 scipy
 supabase
+pyproj
