@@ -6,3 +6,5 @@ shapely
 numpy
 scipy
 supabase
+pyproj
+matplotlib
