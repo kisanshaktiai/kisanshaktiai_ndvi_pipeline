@@ -11,12 +11,14 @@ from datetime import date, datetime, UTC
 # --------------------------------------------------
 # Supabase Client
 # --------------------------------------------------
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 
 if not SUPABASE_URL or not SUPABASE_KEY:
-    raise RuntimeError("Supabase credentials not set")
-
+    raise RuntimeError(
+        "Supabase credentials not set. "
+        "Ensure SUPABASE_URL and SUPABASE_KEY are defined as environment variables."
+    )
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 
