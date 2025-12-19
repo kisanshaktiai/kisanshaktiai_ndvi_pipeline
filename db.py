@@ -1,53 +1,71 @@
+"""
+db.py
+-----
+
+Supabase database access layer for KisanShaktiAI NDVI pipeline.
+
+• Schema-aligned with `lands`, `ndvi_data`, `ndvi_processing_logs`
+• Safe for re-runs (idempotent writes)
+• Logging failures never break pipeline
+• Multi-tenant aware
+• UTC-safe timestamps
+"""
+
 import os
 from typing import List, Dict, Optional
-from supabase import create_client, Client
-from logger import logger
-from dotenv import load_dotenv
-load_dotenv()
 from datetime import date, datetime, UTC
 
-
+from supabase import create_client, Client
+from dotenv import load_dotenv
+from logger import logger
 
 # --------------------------------------------------
-# Supabase Client
+# Environment & Client
 # --------------------------------------------------
-SUPABASE_URL = os.environ.get("SUPABASE_URL")
-SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
+load_dotenv()
+
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
 if not SUPABASE_URL or not SUPABASE_KEY:
     raise RuntimeError(
         "Supabase credentials not set. "
-        "Ensure SUPABASE_URL and SUPABASE_KEY are defined as environment variables."
+        "Ensure SUPABASE_URL and SUPABASE_KEY are defined."
     )
+
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-
 # --------------------------------------------------
-# Fetch active lands
+# Fetch active lands for NDVI processing
 # --------------------------------------------------
 def fetch_lands(limit: int = 100) -> List[Dict]:
+    """
+    Fetch active, non-deleted lands eligible for NDVI processing.
+    """
     try:
         res = (
             supabase.table("lands")
-            .select("id, tenant_id, area_guntas, current_crop, boundary_polygon_old")
+            .select(
+                "id, tenant_id, area_guntas, current_crop, boundary_polygon_old"
+            )
             .eq("is_active", True)
+            .is_("deleted_at", None)
             .limit(limit)
             .execute()
         )
         return res.data or []
 
-    except Exception as e:
+    except Exception:
         logger.exception("Failed to fetch lands")
         return []
 
-
 # --------------------------------------------------
-# Insert / upsert NDVI data (IDEMPOTENT)
+# NDVI time-series insert (IDEMPOTENT)
 # --------------------------------------------------
 def insert_ndvi(row: Dict) -> None:
     """
-    Upserts NDVI row using (land_id, date) uniqueness.
-    Safe for re-runs.
+    Insert or update NDVI time-series data.
+    Enforced uniqueness: (land_id, date)
     """
     try:
         (
@@ -59,63 +77,131 @@ def insert_ndvi(row: Dict) -> None:
             .execute()
         )
 
-    except Exception as e:
+    except Exception:
         logger.exception(
             f"NDVI insert failed for land {row.get('land_id')}"
         )
         raise
 
-
 # --------------------------------------------------
-# Update lands table (latest NDVI snapshot)
+# Update land snapshot (LATEST NDVI ONLY)
 # --------------------------------------------------
-def update_land(
+def update_land_ndvi_snapshot(
+    *,
     land_id: str,
-    ndvi: float,
+    ndvi_value: float,
+    ndvi_date: date,
     thumbnail_url: Optional[str],
 ) -> None:
+    """
+    Update latest NDVI snapshot & processing metadata in `lands`.
+
+    Matches schema exactly:
+    - last_ndvi_value
+    - last_ndvi_calculation
+    - ndvi_thumbnail_url
+    - ndvi_tested
+    - ndvi_status
+    """
     try:
         (
             supabase.table("lands")
             .update(
                 {
-                    "ndvi": round(ndvi, 3),
+                    "last_ndvi_value": round(ndvi_value, 3),
+                    "last_ndvi_calculation": ndvi_date,
                     "ndvi_thumbnail_url": thumbnail_url,
-                    "ndvi_updated_at": datetime.now(UTC).isoformat()
+                    "ndvi_tested": True,
+                    "ndvi_status": "completed",
+                    "last_processed_at": datetime.now(UTC).isoformat(),
+                    "updated_at": datetime.now(UTC).isoformat(),
                 }
             )
             .eq("id", land_id)
             .execute()
         )
 
-    except Exception as e:
-        logger.exception(f"Failed to update land {land_id}")
+    except Exception:
+        logger.exception(f"Failed to update NDVI snapshot for land {land_id}")
         raise
 
-
 # --------------------------------------------------
-# Processing logs (observability)
+# Update land status on failure
 # --------------------------------------------------
-def log_step(
-    step: str,
-    status: str,
+def mark_land_ndvi_failed(
+    *,
     land_id: str,
-    tenant_id: str,
-    error: Optional[str] = None,
 ) -> None:
+    """
+    Mark NDVI processing as failed for a land.
+    """
     try:
-        supabase.table("ndvi_processing_logs").insert(
-            {
-                "step": step,
-                "status": status,
-                "land_id": land_id,
-                "tenant_id": tenant_id,
-                "error": error,
-            }
-        ).execute()
+        (
+            supabase.table("lands")
+            .update(
+                {
+                    "ndvi_status": "failed",
+                    "last_processed_at": datetime.now(UTC).isoformat(),
+                    "updated_at": datetime.now(UTC).isoformat(),
+                }
+            )
+            .eq("id", land_id)
+            .execute()
+        )
 
     except Exception:
-        # Never break pipeline due to logging failure
+        logger.warning(f"Failed to mark land NDVI as failed: {land_id}")
+
+# --------------------------------------------------
+# NDVI processing logs (OBSERVABILITY)
+# --------------------------------------------------
+def log_ndvi_step(
+    *,
+    processing_step: str,
+    step_status: str,
+    tenant_id: str,
+    land_id: Optional[str] = None,
+    satellite_tile_id: Optional[str] = None,
+    started_at: Optional[datetime] = None,
+    error_message: Optional[str] = None,
+    error_details: Optional[Dict] = None,
+    metadata: Optional[Dict] = None,
+) -> None:
+    """
+    Insert NDVI processing log entry.
+
+    • Fully schema-aligned with `ndvi_processing_logs`
+    • Logging failures NEVER break pipeline
+    """
+    try:
+        now = datetime.now(UTC)
+
+        payload = {
+            "processing_step": processing_step,
+            "step_status": step_status,
+            "tenant_id": tenant_id,
+            "land_id": land_id,
+            "satellite_tile_id": satellite_tile_id,
+            "started_at": started_at or now,
+            "completed_at": (
+                now if step_status in ("completed", "failed") else None
+            ),
+            "duration_ms": (
+                int((now - started_at).total_seconds() * 1000)
+                if started_at
+                else None
+            ),
+            "error_message": error_message,
+            "error_details": error_details,
+            "metadata": metadata or {},
+        }
+
+        # Remove NULL fields to keep inserts clean
+        payload = {k: v for k, v in payload.items() if v is not None}
+
+        supabase.table("ndvi_processing_logs").insert(payload).execute()
+
+    except Exception:
         logger.warning(
-            f"Log insert failed for land {land_id}, step {step}"
+            f"NDVI log insert failed | step={processing_step} | land={land_id}"
         )
