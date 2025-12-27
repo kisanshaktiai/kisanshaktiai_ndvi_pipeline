@@ -45,6 +45,7 @@ def process_land(land: dict, supabase) -> dict | None:
     ndvi_series: list[float] = []
     ndre_series: list[float] = []
     ndwi_series: list[float] = []
+    mcari_series: list[float] = []  # NEW: Track MCARI
 
     ndvi_raster = None
     ndvi_transform = None
@@ -80,6 +81,7 @@ def process_land(land: dict, supabase) -> dict | None:
             ndvi = indices["NDVI"]
             ndre = indices["NDRE"]
             ndwi = indices["NDWI"]
+            mcari = indices["MCARI"]  # NEW: Extract MCARI
 
             valid = np.isfinite(ndvi)
             valid_pixels = np.count_nonzero(valid)
@@ -91,6 +93,7 @@ def process_land(land: dict, supabase) -> dict | None:
             ndvi_series.append(float(np.nanmean(ndvi)))
             ndre_series.append(float(np.nanmean(ndre)))
             ndwi_series.append(float(np.nanmean(ndwi)))
+            mcari_series.append(float(np.nanmean(mcari)))  # NEW: Track MCARI
             
             # Track pixel statistics
             all_valid_pixels.append(valid_pixels)
@@ -226,6 +229,10 @@ def process_land(land: dict, supabase) -> dict | None:
     
     ndre_trend_value = trend(ndre_series)
     ndwi_mean = float(np.nanmean(ndwi_series))
+    
+    # NEW: MCARI statistics
+    mcari_mean = float(np.nanmean(mcari_series))
+    mcari_trend_value = trend(mcari_series)
 
     # --------------------------------------------------
     # 7. Return comprehensive results
@@ -244,6 +251,10 @@ def process_land(land: dict, supabase) -> dict | None:
         # Supporting indices
         "ndre_trend": ndre_trend_value,
         "ndwi_mean": ndwi_mean,
+        
+        # NEW: MCARI metrics
+        "mcari_mean": mcari_mean,
+        "mcari_trend": mcari_trend_value,
         
         # Soil moisture (may be None)
         "soil_moisture": soil_moisture_value,

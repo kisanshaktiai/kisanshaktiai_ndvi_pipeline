@@ -1,7 +1,7 @@
 import numpy as np
 
 # ---------------------------------------------------------
-# NDVI / NDRE TREND CALCULATION
+# NDVI / NDRE / MCARI TREND CALCULATION
 # ---------------------------------------------------------
 def trend(values: list[float]) -> float:
     """
@@ -22,10 +22,14 @@ def crop_health(
     ndre_trend: float | None = None,
     ndwi_mean: float | None = None,
     soil_moisture: float | None = None,
+    mcari_mean: float | None = None,  # NEW: MCARI input
+    mcari_trend: float | None = None,  # NEW: MCARI trend
 ):
     """
     Determines crop health label and advisory alerts
     using satellite vegetation, water and soil indicators.
+    
+    Enhanced with MCARI for better chlorophyll/nitrogen assessment.
     """
 
     alerts: list[str] = []
@@ -48,7 +52,21 @@ def crop_health(
         alerts.append("Vegetative growth declining")
 
     # -------------------------------------------------
-    # NDRE – Nitrogen stress
+    # MCARI – Chlorophyll content & Nitrogen stress
+    # NEW: More sensitive than NDRE for early detection
+    # -------------------------------------------------
+    if mcari_mean is not None:
+        # MCARI typical range: 0 to 2+ (higher = more chlorophyll)
+        if mcari_mean < 0.5:
+            alerts.append("Low chlorophyll content detected")
+        elif mcari_mean < 0.8:
+            alerts.append("Moderate chlorophyll stress")
+    
+    if mcari_trend is not None and mcari_trend < -0.05:
+        alerts.append("Chlorophyll declining rapidly (possible N deficiency)")
+
+    # -------------------------------------------------
+    # NDRE – Nitrogen stress (complementary to MCARI)
     # -------------------------------------------------
     if ndre_trend is not None and ndre_trend < -0.01:
         alerts.append("Possible nitrogen deficiency")
@@ -69,13 +87,22 @@ def crop_health(
             alerts.append("Low soil moisture")
 
     # -------------------------------------------------
-    # FINAL HEALTH LABEL
+    # FINAL HEALTH LABEL (enhanced with MCARI)
     # -------------------------------------------------
+    # Prioritize chlorophyll/nitrogen issues detected by MCARI
+    critical_keywords = ["rapidly", "severe", "very low", "declining"]
+    has_critical = any(
+        any(keyword in alert.lower() for keyword in critical_keywords)
+        for alert in alerts
+    )
+    
     if not alerts:
         label = "Healthy"
-    elif len(alerts) == 1:
+    elif has_critical or len(alerts) >= 3:
+        label = "Critical"
+    elif len(alerts) == 2:
         label = "Moderate"
     else:
-        label = "Critical"
+        label = "Moderate"
 
     return label, alerts

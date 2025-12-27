@@ -44,6 +44,9 @@ def build_ndvi_row(
 
         # Water stress
         "ndwi_value": round(result["ndwi_mean"], 3),
+        
+        # NEW: MCARI - Chlorophyll/Nitrogen indicator
+        "mcari_value": round(result["mcari_mean"], 3) if result.get("mcari_mean") else None,
 
         # SAR soil moisture (nullable)
         "soil_moisture": result.get("soil_moisture"),
@@ -60,6 +63,7 @@ def build_ndvi_row(
         "metadata": {
             "ndvi_trend": round(result["ndvi_trend"], 4),
             "ndre_trend": round(result.get("ndre_trend", 0.0), 4),
+            "mcari_trend": round(result.get("mcari_trend", 0.0), 4),  # NEW: MCARI trend
             "health_label": health_label,
             "alerts": alerts,
             "valid_observations": result["valid_observations"],
@@ -124,7 +128,7 @@ def main():
                 continue
 
             # --------------------------------------------------
-            # AGRONOMIC INTERPRETATION
+            # AGRONOMIC INTERPRETATION (Enhanced with MCARI)
             # --------------------------------------------------
             health_label, alerts = crop_health(
                 ndvi_mean=result["ndvi_mean"],
@@ -132,6 +136,8 @@ def main():
                 ndre_trend=result.get("ndre_trend"),
                 ndwi_mean=result.get("ndwi_mean"),
                 soil_moisture=result.get("soil_moisture"),
+                mcari_mean=result.get("mcari_mean"),      # NEW: MCARI
+                mcari_trend=result.get("mcari_trend"),    # NEW: MCARI trend
             )
 
             # --------------------------------------------------
