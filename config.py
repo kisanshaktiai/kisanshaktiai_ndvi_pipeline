@@ -5,6 +5,9 @@
 # Lookback window for satellite data (days)
 LOOKBACK_DAYS = 15
 
+# Sentinel-1 lookback window (longer for SAR availability)
+S1_LOOKBACK_DAYS = 30  # Increased from 15 to improve data availability
+
 # Sentinel collections (Planetary Computer)
 S2_COLLECTION = "sentinel-2-l2a"
 S1_COLLECTION = "sentinel-1-grd"

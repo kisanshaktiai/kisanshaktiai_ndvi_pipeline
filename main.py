@@ -37,6 +37,10 @@ def build_ndvi_row(
         "ndvi_value": round(result["ndvi_mean"], 3),
         "min_ndvi": round(result["ndvi_min"], 3),
         "max_ndvi": round(result["ndvi_max"], 3),
+        
+        # NEW: Statistical metrics
+        "ndvi_std": round(result["ndvi_std"], 4) if result.get("ndvi_std") else None,
+        "median_ndvi": round(result["median_ndvi"], 3) if result.get("median_ndvi") else None,
 
         # Water stress
         "ndwi_value": round(result["ndwi_mean"], 3),
@@ -46,6 +50,11 @@ def build_ndvi_row(
 
         # Thumbnail
         "image_url": result.get("ndvi_thumbnail_url"),
+        
+        # NEW: Quality metrics
+        "valid_pixels": result.get("valid_pixels"),
+        "total_pixels": result.get("total_pixels"),
+        "coverage_percentage": result.get("coverage_percentage"),
 
         # Analytics metadata
         "metadata": {
@@ -54,7 +63,8 @@ def build_ndvi_row(
             "health_label": health_label,
             "alerts": alerts,
             "valid_observations": result["valid_observations"],
-            "ndvi_geotiff_url": result.get("ndvi_geotiff_url"),  # Store GeoTIFF URL in metadata
+            "ndvi_geotiff_url": result.get("ndvi_geotiff_url"),
+            "soil_moisture_error": result.get("soil_moisture_error"),  # Track S1 failures
         },
 
         # Processing info

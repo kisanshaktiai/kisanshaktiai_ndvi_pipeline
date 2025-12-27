@@ -48,6 +48,10 @@ def process_land(land: dict, supabase) -> dict | None:
 
     ndvi_raster = None
     ndvi_transform = None
+    
+    # Track statistics across all observations
+    all_valid_pixels = []
+    all_total_pixels = []
 
     s2_items = fetch_s2_items(geom)
     if not s2_items:
@@ -79,6 +83,7 @@ def process_land(land: dict, supabase) -> dict | None:
 
             valid = np.isfinite(ndvi)
             valid_pixels = np.count_nonzero(valid)
+            total_pixels = ndvi.size
 
             if valid_pixels < MIN_VALID_PIXELS:
                 continue
@@ -86,6 +91,10 @@ def process_land(land: dict, supabase) -> dict | None:
             ndvi_series.append(float(np.nanmean(ndvi)))
             ndre_series.append(float(np.nanmean(ndre)))
             ndwi_series.append(float(np.nanmean(ndwi)))
+            
+            # Track pixel statistics
+            all_valid_pixels.append(valid_pixels)
+            all_total_pixels.append(total_pixels)
 
             # Save first valid raster for thumbnail and GeoTIFF
             if ndvi_raster is None:
@@ -144,44 +153,117 @@ def process_land(land: dict, supabase) -> dict | None:
             )
 
     # --------------------------------------------------
-    # 5. Sentinel-1 SAR soil moisture
+    # 5. Sentinel-1 SAR soil moisture (ENHANCED)
     # --------------------------------------------------
     soil_moisture_value = None
+    s1_error_message = None
+    
     try:
+        logger.debug(f"Fetching Sentinel-1 data for land {land['id']}")
         s1_items = fetch_s1_items(geom)
-        if s1_items:
+        
+        if not s1_items:
+            logger.info(
+                f"No Sentinel-1 data available for land {land['id']} "
+                f"in lookback window. Soil moisture will be NULL."
+            )
+            s1_error_message = "No Sentinel-1 data in lookback window"
+        else:
+            logger.debug(f"Found {len(s1_items)} Sentinel-1 scenes for land {land['id']}")
             s1 = s1_items[0]
-            vv, _ = read_band(s1.assets["VV"], geom)
-            vh, _ = read_band(s1.assets["VH"], geom)
-            soil_moisture_value = soil_moisture(vv, vh)
+            
+            # Check if VV/VH assets exist
+            if "VV" not in s1.assets or "VH" not in s1.assets:
+                logger.warning(
+                    f"Sentinel-1 scene missing VV/VH polarization for land {land['id']}"
+                )
+                s1_error_message = "Missing VV/VH polarization"
+            else:
+                # Read SAR bands
+                vv, _ = read_band(s1.assets["VV"], geom)
+                vh, _ = read_band(s1.assets["VH"], geom)
+                
+                # Calculate soil moisture
+                soil_moisture_value = soil_moisture(vv, vh)
+                logger.info(
+                    f"Soil moisture calculated for land {land['id']}: "
+                    f"{soil_moisture_value:.2f} dB"
+                )
+                
     except Exception as e:
         logger.warning(
             f"Sentinel-1 processing failed for land {land['id']}: {e}"
         )
+        s1_error_message = str(e)
+        # Don't fail the entire pipeline - continue without soil moisture
 
     # --------------------------------------------------
-    # 6. Final statistics
+    # 6. Calculate comprehensive statistics
     # --------------------------------------------------
     ndvi_mean = float(np.nanmean(ndvi_series))
     ndvi_min = float(np.nanmin(ndvi_series))
     ndvi_max = float(np.nanmax(ndvi_series))
-    ndvi_trend = trend(ndvi_series)
-
-    ndre_trend = trend(ndre_series)
+    ndvi_trend_value = trend(ndvi_series)
+    
+    # NEW: Additional statistics from raster
+    ndvi_std = None
+    median_ndvi = None
+    coverage_percentage = None
+    valid_pixels_final = None
+    total_pixels_final = None
+    
+    if ndvi_raster is not None:
+        valid_mask = np.isfinite(ndvi_raster)
+        valid_pixels_final = int(np.count_nonzero(valid_mask))
+        total_pixels_final = int(ndvi_raster.size)
+        
+        if valid_pixels_final > 0:
+            ndvi_std = float(np.nanstd(ndvi_raster))
+            median_ndvi = float(np.nanmedian(ndvi_raster))
+            coverage_percentage = round(
+                (valid_pixels_final / total_pixels_final) * 100, 2
+            )
+    
+    ndre_trend_value = trend(ndre_series)
     ndwi_mean = float(np.nanmean(ndwi_series))
 
     # --------------------------------------------------
-    # 7. Return results with file URLs
+    # 7. Return comprehensive results
     # --------------------------------------------------
-    return {
+    result = {
+        # Core NDVI metrics
         "ndvi_mean": ndvi_mean,
         "ndvi_min": ndvi_min,
         "ndvi_max": ndvi_max,
-        "ndvi_trend": ndvi_trend,
-        "ndre_trend": ndre_trend,
+        "ndvi_trend": ndvi_trend_value,
+        
+        # NEW: Statistical metrics
+        "ndvi_std": ndvi_std,
+        "median_ndvi": median_ndvi,
+        
+        # Supporting indices
+        "ndre_trend": ndre_trend_value,
         "ndwi_mean": ndwi_mean,
+        
+        # Soil moisture (may be None)
         "soil_moisture": soil_moisture_value,
+        "soil_moisture_error": s1_error_message,
+        
+        # File URLs
         "ndvi_thumbnail_url": ndvi_thumbnail_url,
         "ndvi_geotiff_url": ndvi_geotiff_url,
+        
+        # Quality metrics
         "valid_observations": len(ndvi_series),
+        "valid_pixels": valid_pixels_final,
+        "total_pixels": total_pixels_final,
+        "coverage_percentage": coverage_percentage,
     }
+    
+    logger.debug(
+        f"Land {land['id']} processing complete: "
+        f"NDVI={ndvi_mean:.3f}, trend={ndvi_trend_value:.4f}, "
+        f"coverage={coverage_percentage}%, soil_moisture={soil_moisture_value}"
+    )
+    
+    return result
