@@ -7,6 +7,7 @@ from db import (
     update_land_ndvi_snapshot,
     mark_land_ndvi_failed,
     log_ndvi_step,
+    get_supabase_client,
 )
 
 from processor import process_land
@@ -53,6 +54,7 @@ def build_ndvi_row(
             "health_label": health_label,
             "alerts": alerts,
             "valid_observations": result["valid_observations"],
+            "ndvi_geotiff_url": result.get("ndvi_geotiff_url"),  # Store GeoTIFF URL in metadata
         },
 
         # Processing info
@@ -69,6 +71,9 @@ def build_ndvi_row(
 # --------------------------------------------------
 def main():
     logger.info("NDVI pipeline started")
+
+    # Get Supabase client for storage uploads
+    supabase = get_supabase_client()
 
     lands = fetch_lands()
 
@@ -94,9 +99,9 @@ def main():
             )
 
             # --------------------------------------------------
-            # PROCESS LAND
+            # PROCESS LAND (with Supabase client for uploads)
             # --------------------------------------------------
-            result = process_land(land)
+            result = process_land(land, supabase)
 
             if result is None:
                 log_ndvi_step(
@@ -139,6 +144,7 @@ def main():
                 ndvi_value=result["ndvi_mean"],
                 ndvi_date=date.today(),
                 thumbnail_url=result.get("ndvi_thumbnail_url"),
+                geotiff_url=result.get("ndvi_geotiff_url"),
             )
 
             # --------------------------------------------------
@@ -150,6 +156,11 @@ def main():
                 tenant_id=tenant_id,
                 land_id=land_id,
                 started_at=start_time,
+                metadata={
+                    "thumbnail_url": result.get("ndvi_thumbnail_url"),
+                    "geotiff_url": result.get("ndvi_geotiff_url"),
+                    "health_label": health_label,
+                }
             )
 
         except Exception as e:

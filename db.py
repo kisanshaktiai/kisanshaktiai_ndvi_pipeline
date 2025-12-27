@@ -92,6 +92,7 @@ def update_land_ndvi_snapshot(
     ndvi_value: float,
     ndvi_date: date,
     thumbnail_url: Optional[str],
+    geotiff_url: Optional[str] = None,
 ) -> None:
     """
     Update latest NDVI snapshot & processing metadata in `lands`.
@@ -100,23 +101,28 @@ def update_land_ndvi_snapshot(
     - last_ndvi_value
     - last_ndvi_calculation
     - ndvi_thumbnail_url
+    - ndvi_geotiff_url (optional)
     - ndvi_tested
     - ndvi_status
     """
     try:
+        update_data = {
+            "last_ndvi_value": round(ndvi_value, 3),
+            "last_ndvi_calculation": ndvi_date.isoformat(),
+            "ndvi_thumbnail_url": thumbnail_url,
+            "ndvi_tested": True,
+            "ndvi_status": "completed",
+            "last_processed_at": datetime.now(UTC).isoformat(),
+            "updated_at": datetime.now(UTC).isoformat(),
+        }
+        
+        # Add GeoTIFF URL if provided
+        if geotiff_url:
+            update_data["ndvi_geotiff_url"] = geotiff_url
+        
         (
             supabase.table("lands")
-            .update(
-                {
-                    "last_ndvi_value": round(ndvi_value, 3),
-                    "last_ndvi_calculation": ndvi_date.isoformat(),
-                    "ndvi_thumbnail_url": thumbnail_url,
-                    "ndvi_tested": True,
-                    "ndvi_status": "completed",
-                    "last_processed_at": datetime.now(UTC).isoformat(),
-                    "updated_at": datetime.now(UTC).isoformat(),
-                }
-            )
+            .update(update_data)
             .eq("id", land_id)
             .execute()
         )
@@ -172,6 +178,7 @@ def log_ndvi_step(
 
     • Fully schema-aligned with `ndvi_processing_logs`
     • Logging failures NEVER break pipeline
+    • Enhanced error handling with detailed logging
     """
     try:
         now = datetime.now(UTC)
@@ -182,9 +189,9 @@ def log_ndvi_step(
             "tenant_id": tenant_id,
             "land_id": land_id,
             "satellite_tile_id": satellite_tile_id,
-            "started_at": started_at or now,
+            "started_at": (started_at or now).isoformat(),
             "completed_at": (
-                now if step_status in ("completed", "failed") else None
+                now.isoformat() if step_status in ("completed", "failed") else None
             ),
             "duration_ms": (
                 int((now - started_at).total_seconds() * 1000)
@@ -200,8 +207,34 @@ def log_ndvi_step(
         payload = {k: v for k, v in payload.items() if v is not None}
 
         supabase.table("ndvi_processing_logs").insert(payload).execute()
-
-    except Exception:
-        logger.warning(
-            f"NDVI log insert failed | step={processing_step} | land={land_id}"
+        
+        logger.debug(
+            f"NDVI log inserted | step={processing_step} | "
+            f"status={step_status} | land={land_id}"
         )
+
+    except Exception as e:
+        # Detailed error logging without breaking pipeline
+        logger.warning(
+            f"NDVI log insert failed | step={processing_step} | "
+            f"land={land_id} | error={str(e)}"
+        )
+        
+        # If this is a critical error (table doesn't exist), log once
+        if "relation" in str(e).lower() and "does not exist" in str(e).lower():
+            logger.error(
+                "CRITICAL: ndvi_processing_logs table does not exist. "
+                "Please create it in Supabase. Processing will continue "
+                "but logs will not be saved."
+            )
+
+
+# --------------------------------------------------
+# Get Supabase client (for passing to processor)
+# --------------------------------------------------
+def get_supabase_client() -> Client:
+    """
+    Return the configured Supabase client.
+    Used by processor to upload files to storage.
+    """
+    return supabase

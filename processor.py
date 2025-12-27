@@ -9,12 +9,23 @@ from indices import compute_indices
 from sar_soil_moisture import soil_moisture
 from analysis import trend
 from ndvi_thumbnail import generate_ndvi_thumbnail
+from ndvi_geotiff import write_ndvi_geotiff
 from config import MIN_VALID_PIXELS
 from logger import logger
-from ndvi_geotiff import write_ndvi_geotiff
 
 
-def process_land(land: dict) -> dict | None:
+def process_land(land: dict, supabase) -> dict | None:
+    """
+    Process land for NDVI calculation, thumbnail generation, and GeoTIFF export.
+    
+    Args:
+        land: Land record from database
+        supabase: Supabase client for storage uploads
+        
+    Returns:
+        Dictionary with NDVI metrics and file URLs, or None if processing failed
+    """
+    
     # --------------------------------------------------
     # 1. Geometry
     # --------------------------------------------------
@@ -60,7 +71,7 @@ def process_land(land: dict) -> dict | None:
             # Cloud mask
             bands = cloud_mask(bands)
 
-            # ✅ CORRECT index extraction
+            # Compute indices
             indices = compute_indices(bands)
             ndvi = indices["NDVI"]
             ndre = indices["NDRE"]
@@ -76,7 +87,7 @@ def process_land(land: dict) -> dict | None:
             ndre_series.append(float(np.nanmean(ndre)))
             ndwi_series.append(float(np.nanmean(ndwi)))
 
-            # Save first valid raster for thumbnail
+            # Save first valid raster for thumbnail and GeoTIFF
             if ndvi_raster is None:
                 ndvi_raster = ndvi
                 ndvi_transform = ref_transform
@@ -95,39 +106,45 @@ def process_land(land: dict) -> dict | None:
         return None
 
     # --------------------------------------------------
-    # 3. NDVI thumbnail
+    # 3. NDVI thumbnail (PNG + upload to Supabase)
     # --------------------------------------------------
     ndvi_thumbnail_url = None
     if ndvi_raster is not None:
         try:
-            ndvi_thumbnail_url = generate_ndvi_thumbnail(
+            public_url, png_path, json_path = generate_ndvi_thumbnail(
                 ndvi_array=ndvi_raster,
                 transform=ndvi_transform,
                 land_id=land["id"],
+                supabase=supabase,
             )
+            ndvi_thumbnail_url = public_url
+            
         except Exception as e:
             logger.warning(
                 f"NDVI thumbnail failed for land {land['id']}: {e}"
             )
-            
-            
-    ndvi_geotiff_path = None
 
+    # --------------------------------------------------
+    # 4. NDVI GeoTIFF (full resolution + upload to Supabase)
+    # --------------------------------------------------
+    ndvi_geotiff_url = None
     if ndvi_raster is not None and ndvi_transform is not None:
         try:
-            ndvi_geotiff_path = write_ndvi_geotiff(
+            public_url, local_path = write_ndvi_geotiff(
                 ndvi_array=ndvi_raster,
                 transform=ndvi_transform,
-                land_id=land["id"]
+                land_id=land["id"],
+                supabase=supabase,
             )
+            ndvi_geotiff_url = public_url
+            
         except Exception as e:
             logger.warning(
                 f"NDVI GeoTIFF failed for land {land['id']}: {e}"
             )
 
-
     # --------------------------------------------------
-    # 4. Sentinel-1 SAR soil moisture
+    # 5. Sentinel-1 SAR soil moisture
     # --------------------------------------------------
     soil_moisture_value = None
     try:
@@ -143,7 +160,7 @@ def process_land(land: dict) -> dict | None:
         )
 
     # --------------------------------------------------
-    # 5. Final statistics
+    # 6. Final statistics
     # --------------------------------------------------
     ndvi_mean = float(np.nanmean(ndvi_series))
     ndvi_min = float(np.nanmin(ndvi_series))
@@ -154,7 +171,7 @@ def process_land(land: dict) -> dict | None:
     ndwi_mean = float(np.nanmean(ndwi_series))
 
     # --------------------------------------------------
-    # 6. Return
+    # 7. Return results with file URLs
     # --------------------------------------------------
     return {
         "ndvi_mean": ndvi_mean,
@@ -165,5 +182,6 @@ def process_land(land: dict) -> dict | None:
         "ndwi_mean": ndwi_mean,
         "soil_moisture": soil_moisture_value,
         "ndvi_thumbnail_url": ndvi_thumbnail_url,
+        "ndvi_geotiff_url": ndvi_geotiff_url,
         "valid_observations": len(ndvi_series),
     }

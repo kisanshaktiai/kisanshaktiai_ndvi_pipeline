@@ -3,28 +3,36 @@ import numpy as np
 import rasterio
 from rasterio.enums import Compression
 from rasterio.transform import Affine
+from typing import Optional, Tuple
+from supabase import Client
+
+from logger import logger
 
 
 def write_ndvi_geotiff(
     ndvi_array: np.ndarray,
     transform: Affine,
     land_id: str,
+    supabase: Client = None,
     crs: str = "EPSG:4326",
     vmin: float = -0.2,
     vmax: float = 0.9,
-) -> str:
+) -> Tuple[Optional[str], Optional[str]]:
     """
-    Write NDVI GeoTIFF with full georeferencing.
+    Write NDVI GeoTIFF with full georeferencing and upload to Supabase Storage.
 
     Args:
         ndvi_array: NDVI numpy array (2D)
         transform: rasterio affine transform
         land_id: UUID of land
+        supabase: Supabase client for storage upload (optional)
         crs: Coordinate Reference System
         vmin, vmax: NDVI clipping range
 
     Returns:
-        File path to NDVI GeoTIFF
+        Tuple of (public_url, local_path)
+        public_url: Supabase Storage URL if upload successful, None otherwise
+        local_path: Local GeoTIFF file path
     """
 
     # --------------------------------------------------
@@ -66,5 +74,31 @@ def write_ndvi_geotiff(
     ) as dst:
         dst.write(ndvi, 1)
 
-    return output_path
+    logger.info(f"NDVI GeoTIFF created locally: {output_path}")
 
+    # --------------------------------------------------
+    # 4. Upload to Supabase Storage (if client provided)
+    # --------------------------------------------------
+    if supabase is None:
+        logger.warning("No Supabase client provided, skipping upload")
+        return None, output_path
+
+    try:
+        from storage import upload_ndvi_geotiff
+        
+        public_url = upload_ndvi_geotiff(
+            supabase=supabase,
+            land_id=land_id,
+            geotiff_path=output_path
+        )
+        
+        if public_url:
+            logger.info(f"NDVI GeoTIFF uploaded: {land_id}")
+            return public_url, output_path
+        else:
+            logger.warning(f"NDVI GeoTIFF upload failed: {land_id}")
+            return None, output_path
+            
+    except Exception as e:
+        logger.error(f"Error uploading NDVI GeoTIFF for {land_id}: {e}")
+        return None, output_path

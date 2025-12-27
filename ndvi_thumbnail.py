@@ -4,6 +4,10 @@ import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib import colors
 from rasterio.transform import array_bounds
+from typing import Tuple, Optional
+from supabase import Client
+
+from logger import logger
 
 
 # ---------------------------------------------------------
@@ -24,19 +28,27 @@ def generate_ndvi_thumbnail(
     ndvi_array: np.ndarray,
     transform,
     land_id: str,
+    supabase: Client,
     size: int = 256,
     vmin: float = -0.2,
     vmax: float = 0.9,
-) -> str:
+) -> Tuple[Optional[str], Optional[str], Optional[str]]:
     """
-    Generate NDVI PNG thumbnail + geospatial metadata.
+    Generate NDVI PNG thumbnail + geospatial metadata and upload to Supabase Storage.
 
-    Outputs:
-    - PNG thumbnail
-    - JSON metadata (lat/lon bounds for map overlay)
+    Args:
+        ndvi_array: NDVI numpy array (2D)
+        transform: rasterio affine transform
+        land_id: UUID of land
+        supabase: Supabase client for storage upload
+        size: Thumbnail size in pixels
+        vmin, vmax: NDVI value range for colormap
 
     Returns:
-    - Relative/public URL to PNG
+        Tuple of (public_url, local_png_path, local_json_path)
+        public_url: Supabase Storage URL if upload successful, None otherwise
+        local_png_path: Local PNG file path
+        local_json_path: Local JSON metadata file path
     """
 
     # --------------------------------------------------
@@ -90,7 +102,7 @@ def generate_ndvi_thumbnail(
     plt.close(fig)
 
     # --------------------------------------------------
-    # 5. Save metadata JSON (CRITICAL)
+    # 5. Save metadata JSON
     # --------------------------------------------------
     metadata = {
         "land_id": land_id,
@@ -116,6 +128,27 @@ def generate_ndvi_thumbnail(
         json.dump(metadata, f, indent=2)
 
     # --------------------------------------------------
-    # 6. Return public path
+    # 6. Upload to Supabase Storage
     # --------------------------------------------------
-    return f"/thumbnails/ndvi/{land_id}.png"
+    try:
+        from storage import upload_ndvi_thumbnail
+        
+        public_url = upload_ndvi_thumbnail(
+            supabase=supabase,
+            land_id=land_id,
+            png_path=png_path,
+            json_path=json_path
+        )
+        
+        if public_url:
+            logger.info(f"NDVI thumbnail uploaded: {land_id}")
+            return public_url, png_path, json_path
+        else:
+            logger.warning(f"NDVI thumbnail upload failed: {land_id}")
+            # Return local path as fallback
+            return f"/thumbnails/ndvi/{land_id}.png", png_path, json_path
+            
+    except Exception as e:
+        logger.error(f"Error uploading NDVI thumbnail for {land_id}: {e}")
+        # Return local path as fallback
+        return f"/thumbnails/ndvi/{land_id}.png", png_path, json_path
