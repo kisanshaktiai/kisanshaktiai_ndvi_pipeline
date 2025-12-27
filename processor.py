@@ -63,6 +63,15 @@ def process_land(land: dict, supabase) -> dict | None:
         try:
             # Reference 10m grid
             B04, ref_transform = read_band(item.assets["B04"], geom)
+            
+            # ============================================================
+            # DIAGNOSTIC: Log band value ranges (first scene only)
+            # ============================================================
+            if ndvi_raster is None:
+                logger.info(
+                    f"Land {land['id']} - Band ranges: "
+                    f"B04={np.nanmin(B04):.4f}-{np.nanmax(B04):.4f}, "
+                )
 
             bands = {
                 "B04": B04,
@@ -72,6 +81,17 @@ def process_land(land: dict, supabase) -> dict | None:
                 "B05": read_band(item.assets["B05"], geom, (B04, ref_transform))[0],
                 "SCL": read_band(item.assets["SCL"], geom, (B04, ref_transform))[0],
             }
+            
+            # ============================================================
+            # DIAGNOSTIC: Log band ranges for MCARI validation
+            # ============================================================
+            if ndvi_raster is None:
+                logger.info(
+                    f"Land {land['id']} - All bands: "
+                    f"B03={np.nanmin(bands['B03']):.4f}-{np.nanmax(bands['B03']):.4f}, "
+                    f"B04={np.nanmin(bands['B04']):.4f}-{np.nanmax(bands['B04']):.4f}, "
+                    f"B05={np.nanmin(bands['B05']):.4f}-{np.nanmax(bands['B05']):.4f}"
+                )
 
             # Cloud mask
             bands = cloud_mask(bands)
@@ -93,7 +113,20 @@ def process_land(land: dict, supabase) -> dict | None:
             ndvi_series.append(float(np.nanmean(ndvi)))
             ndre_series.append(float(np.nanmean(ndre)))
             ndwi_series.append(float(np.nanmean(ndwi)))
-            mcari_series.append(float(np.nanmean(mcari)))  # NEW: Track MCARI
+            
+            # ============================================================
+            # MCARI: Validate before adding to series
+            # ============================================================
+            mcari_mean_scene = float(np.nanmean(mcari))
+            
+            # Check if MCARI is in reasonable range
+            if -1.0 <= mcari_mean_scene <= 5.0:
+                mcari_series.append(mcari_mean_scene)
+            else:
+                logger.warning(
+                    f"Land {land['id']} - MCARI out of range: {mcari_mean_scene:.2f}. "
+                    f"Skipping this observation. Check band scaling."
+                )
             
             # Track pixel statistics
             all_valid_pixels.append(valid_pixels)
@@ -230,9 +263,34 @@ def process_land(land: dict, supabase) -> dict | None:
     ndre_trend_value = trend(ndre_series)
     ndwi_mean = float(np.nanmean(ndwi_series))
     
-    # NEW: MCARI statistics
-    mcari_mean = float(np.nanmean(mcari_series))
-    mcari_trend_value = trend(mcari_series)
+    # ============================================================
+    # NEW: MCARI statistics with validation
+    # ============================================================
+    mcari_mean = None
+    mcari_trend_value = None
+    
+    if len(mcari_series) >= 2:
+        mcari_mean = float(np.nanmean(mcari_series))
+        mcari_trend_value = trend(mcari_series)
+        
+        # Final validation check
+        if abs(mcari_mean) > 10:
+            logger.error(
+                f"Land {land['id']} - MCARI mean out of range: {mcari_mean:.2f}. "
+                f"Setting to None. Band scaling issue detected."
+            )
+            mcari_mean = None
+            mcari_trend_value = None
+        else:
+            logger.info(
+                f"Land {land['id']} - MCARI calculated: "
+                f"mean={mcari_mean:.3f}, trend={mcari_trend_value:.4f}"
+            )
+    else:
+        logger.warning(
+            f"Land {land['id']} - Insufficient valid MCARI observations "
+            f"({len(mcari_series)} scenes)"
+        )
 
     # --------------------------------------------------
     # 7. Return comprehensive results
@@ -252,7 +310,7 @@ def process_land(land: dict, supabase) -> dict | None:
         "ndre_trend": ndre_trend_value,
         "ndwi_mean": ndwi_mean,
         
-        # NEW: MCARI metrics
+        # NEW: MCARI metrics (may be None if validation failed)
         "mcari_mean": mcari_mean,
         "mcari_trend": mcari_trend_value,
         
@@ -271,10 +329,10 @@ def process_land(land: dict, supabase) -> dict | None:
         "coverage_percentage": coverage_percentage,
     }
     
-    logger.debug(
+    logger.info(
         f"Land {land['id']} processing complete: "
-        f"NDVI={ndvi_mean:.3f}, trend={ndvi_trend_value:.4f}, "
-        f"coverage={coverage_percentage}%, soil_moisture={soil_moisture_value}"
+        f"NDVI={ndvi_mean:.3f}, MCARI={mcari_mean if mcari_mean else 'N/A'}, "
+        f"trend={ndvi_trend_value:.4f}, coverage={coverage_percentage}%"
     )
     
     return result
