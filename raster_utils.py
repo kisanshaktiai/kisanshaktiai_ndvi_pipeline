@@ -116,6 +116,11 @@ def read_band(item, band_key: str, geometry, reference=None, categorical=False):
     """
     Read one band clipped to `geometry`.
 
+    Returns (array, transform, crs). The CRS is part of the contract:
+    the caller assembles `reference = (shape, transform, crs)` and every
+    subsequent band is reprojected onto that exact grid. Omitting the CRS
+    makes reproject() raise "Missing dst_crs" on every band.
+
     categorical=True  -> nearest-neighbour resampling (SCL). THE P-04 FIX.
     categorical=False -> bilinear, and DN converted to reflectance.
 
@@ -140,9 +145,21 @@ def read_band(item, band_key: str, geometry, reference=None, categorical=False):
             arr = to_reflectance(data, item, band_key)
 
         if reference is None:
-            return arr, transform
+            # Return the CRS. Without it the caller cannot build a valid
+            # reference grid and reproject() raises "Missing dst_crs".
+            return arr, transform, src.crs
 
         ref_shape, ref_transform, ref_crs = reference
+
+        # Fail loudly rather than letting rasterio raise a bare
+        # "Missing dst_crs" that reads like a data problem. It is not - it
+        # means the caller built an incomplete reference grid.
+        if ref_crs is None:
+            raise ValueError(
+                f"reference grid for band {band_key} has no CRS; "
+                f"read_band must return (array, transform, crs)"
+            )
+
         dst = np.empty(ref_shape, dtype="float32" if not categorical else "int16")
 
         reproject(
@@ -155,7 +172,7 @@ def read_band(item, band_key: str, geometry, reference=None, categorical=False):
             # ---- P-04 FIX -------------------------------------------------
             resampling=Resampling.nearest if categorical else Resampling.bilinear,
         )
-        return dst, ref_transform
+        return dst, ref_transform, ref_crs
 
 
 # ---------------------------------------------------------------------------

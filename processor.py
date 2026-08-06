@@ -71,24 +71,28 @@ def process_acquisition(item, geom_buffered, buffer_applied: bool,
 
     try:
         # --- reference grid: B04 at 10 m -------------------------------
-        b04, ref_transform = read_band(item, "B04", geom_buffered)
-        ref = (b04.shape, ref_transform, None)
+        # Reference grid: B04 at 10 m. The CRS MUST be carried through -
+        # passing None here made reproject() raise "Missing dst_crs" on every
+        # band of every scene, which surfaced as a total data outage rather
+        # than the one-line contract bug it was.
+        b04, ref_transform, ref_crs = read_band(item, "B04", geom_buffered)
+        ref = (b04.shape, ref_transform, ref_crs)
 
         with_ref = {}
         for bk in S2_BANDS_10M:
             if bk == "B04":
                 with_ref[bk] = b04
             else:
-                with_ref[bk], _ = read_band(item, bk, geom_buffered, reference=ref)
+                with_ref[bk], _, _ = read_band(item, bk, geom_buffered, reference=ref)
 
         for bk in S2_BANDS_20M:
             try:
-                with_ref[bk], _ = read_band(item, bk, geom_buffered, reference=ref)
+                with_ref[bk], _, _ = read_band(item, bk, geom_buffered, reference=ref)
             except Exception as e:
                 logger.debug(f"Band {bk} unavailable on {meta['scene_id']}: {e}")
 
         # --- SCL: NEAREST resampling (P-04 fix) ------------------------
-        scl, _ = read_band(item, "SCL", geom_buffered, reference=ref, categorical=True)
+        scl, _, _ = read_band(item, "SCL", geom_buffered, reference=ref, categorical=True)
 
         masks = scl_masks(scl)
         qa = assess(
@@ -306,9 +310,9 @@ def _process_s1(land: dict, geom_buffered, buffer_applied: bool) -> List[dict]:
 
     try:
         assets = {k.lower(): k for k in item.assets}
-        vv, ref_transform = read_band(item, assets["vv"], geom_buffered)
-        ref = (vv.shape, ref_transform, None)
-        vh, _ = read_band(item, assets["vh"], geom_buffered, reference=ref)
+        vv, ref_transform, ref_crs = read_band(item, assets["vv"], geom_buffered)
+        ref = (vv.shape, ref_transform, ref_crs)
+        vh, _, _ = read_band(item, assets["vh"], geom_buffered, reference=ref)
 
         res = rvi_from_gamma0(vv, vh)
         if not res["accepted"]:
