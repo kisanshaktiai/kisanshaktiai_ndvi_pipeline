@@ -132,9 +132,17 @@ def read_band(item, band_key: str, geometry, reference=None, categorical=False):
     with rasterio.open(asset.href) as src:
         geom_proj = reproject_geometry(geometry, src.crs)
 
+        # all_touched=True includes any pixel the polygon intersects, not
+        # only those whose CENTRE falls inside it. Two lands returned
+        # valid_px=0/0 on the 20 m SCL band: a 0.23-acre field after a -10 m
+        # buffer can be smaller than one 20 m SCL pixel, so centre-based
+        # rasterisation selected nothing and the field vanished silently.
+        # For fields of this size the polygon IS roughly one pixel; including
+        # touched pixels is the only way to sample them at all, and the
+        # micro-land confidence penalty carries the resulting uncertainty.
         data, transform = rio_mask(
             src, [mapping(geom_proj)],
-            crop=True, filled=True,
+            crop=True, filled=True, all_touched=True,
             nodata=src.nodata if src.nodata is not None else 0,
         )
         data = data[0] if data.ndim == 3 else data

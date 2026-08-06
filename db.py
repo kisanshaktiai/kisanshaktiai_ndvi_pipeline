@@ -232,13 +232,16 @@ def update_land_snapshot(*, land_id: str, ndvi_value, acquisition_date,
 
 def mark_land_status(land_id: str, status: str, note: str = None) -> None:
     try:
-        supabase.table("lands").update({
-            "ndvi_status": status,
-            "ndvi_status_note": note,
-            "last_processed_at": datetime.now(timezone.utc).isoformat(),
-        }).eq("id", land_id).execute()
-    except Exception:
-        logger.warning(f"status update failed for {land_id}")
+        with_retry(
+            lambda: supabase.table("lands").update({
+                "ndvi_status": status,
+                "ndvi_status_note": note,
+                "last_processed_at": datetime.now(timezone.utc).isoformat(),
+            }).eq("id", land_id).execute(),
+            what=f"land status update {land_id}", attempts=2,
+        )
+    except Exception as e:
+        logger.warning(f"status update failed for {land_id}: {type(e).__name__}: {e}")
 
 
 # ---------------------------------------------------------------------------

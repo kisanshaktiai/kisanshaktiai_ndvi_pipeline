@@ -88,7 +88,30 @@ MIN_BUFFERED_AREA_M2 = 400.0        # below this, erosion would erase the field
 # ---------------------------------------------------------------------------
 # v1 accepted an acquisition on >= 4 valid pixels with no coverage floor, then
 # stored it indistinguishably from a 2000-pixel observation.
-MIN_VALID_PIXELS = 12               # ~0.12 ha of clean canopy
+# REVISED after the 2026-08-06 19:29 run. The original value of 12 was an
+# absolute floor applied to every field regardless of size, and it excluded
+# this tenant's smallholdings BY GEOMETRY, not by data quality:
+#
+#   accepted lands : 0.42 - 56.84 acre, radar valid_pixels 13 .. 2096
+#   skipped lands  : 0.23 -  1.00 acre, radar valid_pixels 10 / 11 (8 lands)
+#                                                            6      (1 land)
+#   3 of the 9 skipped can NEVER reach 12 pixels - a 0.23-acre field is
+#   ~930 m2 = ~9 Sentinel pixels in total. The threshold was structurally
+#   impossible for them.
+#
+# 12 sat exactly on the dividing line: the smallest ACCEPTED field had 13.
+# That is a threshold artefact, not a quality boundary.
+#
+# 8 is the new floor. Rationale: SAR speckle needs a minimum number of
+# independent looks for a stable mean; below ~8 the estimate is dominated by
+# speckle and edge mixing. 8 recovers 8 of the 9 skipped lands and still
+# refuses the 6-pixel case, which is genuinely too small to average.
+#
+# Fields between 8 and ~20 pixels are NOT treated as equal to large fields:
+# MICRO_LAND_FACTOR already discounts confidence by 0.65 and flags
+# micro_land=true, so a small-field observation is stored honestly rather
+# than either discarded or overstated.
+MIN_VALID_PIXELS = 8
 MIN_VALID_FRACTION = 0.50           # >=50% of the BUFFERED field must be clean
 MIN_QUALITY_SCORE = 0.35            # below this the row is rejected outright
 
