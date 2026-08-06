@@ -61,7 +61,8 @@ def _r(x, nd=NDVI_DECIMALS):
 
 
 def process_acquisition(item, geom_buffered, buffer_applied: bool,
-                        land: dict, geom_conf: str = "high") -> Optional[dict]:
+                        land: dict, geom_conf: str = "high",
+                        reject_sink: Optional[list] = None) -> Optional[dict]:
     """
     Process ONE Sentinel-2 acquisition over ONE field.
     Returns a complete row dict, or None if the acquisition is rejected.
@@ -103,10 +104,33 @@ def process_acquisition(item, geom_buffered, buffer_applied: bool,
         )
 
         if not qa.accepted:
-            logger.debug(
-                f"Acquisition {meta['scene_id']} rejected for land "
-                f"{land['id']}: {qa.reject_reason}"
+            # INFO, not DEBUG. The first live run rejected 100% of optical
+            # acquisitions on all 29 lands and the reason was invisible at
+            # LOG_LEVEL=INFO - indistinguishable from a bug. A rejection
+            # without a stated reason is the exact failure mode this pipeline
+            # exists to remove.
+            logger.info(
+                f"REJECT optical | land={land['id']} scene={meta['scene_id']} "
+                f"| {qa.reject_reason} "
+                f"| cloud={qa.cloud_fraction:.0%} shadow={qa.shadow_fraction:.0%} "
+                f"snow={qa.snow_fraction:.0%} water={qa.water_fraction:.0%} "
+                f"valid_px={qa.valid_pixels}/{qa.field_pixels} "
+                f"valid_frac={qa.valid_fraction:.0%} q={qa.quality_score}"
             )
+            if reject_sink is not None:
+                reject_sink.append({
+                    "scene_id": meta["scene_id"],
+                    "acquisition_date": meta["acquisition_date"],
+                    "reason": qa.reject_reason,
+                    "cloud_fraction": qa.cloud_fraction,
+                    "shadow_fraction": qa.shadow_fraction,
+                    "snow_fraction": qa.snow_fraction,
+                    "water_fraction": qa.water_fraction,
+                    "valid_pixels": qa.valid_pixels,
+                    "field_pixels": qa.field_pixels,
+                    "valid_fraction": qa.valid_fraction,
+                    "quality_score": qa.quality_score,
+                })
             return None
 
         # --- indices over crop-surface pixels only ---------------------
@@ -276,8 +300,10 @@ def process_land(land: dict, lookback_days: int = None,
 
     items = scenes if scenes is not None else search_s2(geom, days=lookback_days)
     rows = []
+    rejects: List[dict] = []
     for item in items:
-        r = process_acquisition(item, geom_buf, buffer_applied, land, geom_conf)
+        r = process_acquisition(item, geom_buf, buffer_applied, land, geom_conf,
+                                reject_sink=rejects)
         if r:
             r["field_area_m2"] = round(area_m2, 1)
             rows.append(r)
@@ -295,11 +321,27 @@ def process_land(land: dict, lookback_days: int = None,
     if not ENABLE_S1_FALLBACK:
         return []
 
+    # Aggregate WHY optical failed, so a monsoon rejection is instantly
+    # distinguishable from a processing bug.
+    if rejects:
+        reasons = {}
+        for r in rejects:
+            key = (r["reason"] or "unknown").split()[0]
+            reasons[key] = reasons.get(key, 0) + 1
+        logger.info(
+            f"Land {land['id']}: optical 0/{len(items)} accepted | "
+            f"reasons={reasons} | "
+            f"mean_field_cloud={sum(r['cloud_fraction'] for r in rejects)/len(rejects):.0%}"
+        )
     logger.info(f"Land {land['id']}: no usable optical data, trying Sentinel-1")
-    return _process_s1(land, geom_buf, buffer_applied)
+    s1 = _process_s1(land, geom_buf, buffer_applied, geom_conf)
+    for row in s1:
+        row.setdefault("metadata", {})["optical_rejects"] = rejects[:6]
+    return s1
 
 
-def _process_s1(land: dict, geom_buffered, buffer_applied: bool) -> List[dict]:
+def _process_s1(land: dict, geom_buffered, buffer_applied: bool,
+                geom_conf: str = "high") -> List[dict]:
     pairs = search_s1(geom_buffered)
     if not pairs:
         return []
@@ -316,7 +358,7 @@ def _process_s1(land: dict, geom_buffered, buffer_applied: bool) -> List[dict]:
 
         res = rvi_from_gamma0(vv, vh)
         if not res["accepted"]:
-            logger.debug(f"S1 rejected for land {land['id']}: {res['reject_reason']}")
+            logger.info(f"REJECT radar | land={land['id']} | {res['reject_reason']}")
             return []
 
         return [{
@@ -344,8 +386,15 @@ def _process_s1(land: dict, geom_buffered, buffer_applied: bool) -> List[dict]:
             "spatial_resolution": 10,
 
             "valid_pixels": res["valid_pixels"],
-            "quality_score": 0.50,          # radar proxy: capped medium
+            # Radar is a structural proxy, not an optical measurement.
+            # quality describes the measurement; confidence describes how far
+            # a decision may lean on it. Both are capped, and confidence is
+            # discounted further because RVI cannot separate chlorophyll from
+            # canopy structure. The DB enforces confidence <= quality.
+            "quality_score": 0.50,
+            "confidence_score": 0.35,
             "confidence_level": "medium",
+            "geometry_confidence": geom_conf,
             "buffer_applied": buffer_applied,
             "metadata": {
                 "note": "optical unavailable (cloud); radar vegetation proxy",

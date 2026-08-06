@@ -41,6 +41,58 @@ def get_supabase_client() -> Client:
 
 
 # ---------------------------------------------------------------------------
+# TRANSIENT-ERROR RETRY
+# ---------------------------------------------------------------------------
+# The first successful production run lost several writes to:
+#     httpx.RemoteProtocolError: Server disconnected
+# PostgREST over HTTP/2 drops idle multiplexed streams under concurrency
+# (TILE_WORKERS=4). These are transient and safely retryable: every write in
+# this pipeline is either an idempotent upsert keyed on (land_id, scene_id)
+# or a last-writer-wins snapshot update.
+#
+# Without this, a dropped connection silently skipped a lands snapshot update
+# - the same class of silent loss the whole audit was about.
+_TRANSIENT = (
+    "server disconnected", "connection reset", "connection aborted",
+    "remoteprotocolerror", "timeout", "temporarily unavailable",
+    "connection error", "read timeout", "502", "503", "504",
+)
+
+
+def _is_transient(exc: Exception) -> bool:
+    msg = f"{type(exc).__name__} {exc}".lower()
+    return any(t in msg for t in _TRANSIENT)
+
+
+def with_retry(fn, *, what: str, attempts: int = 3, base_delay: float = 0.5):
+    """
+    Run fn(), retrying transient network failures with exponential backoff.
+
+    Non-transient errors (constraint violations, missing columns) raise
+    immediately - retrying those would only hide a real defect.
+    """
+    import time as _time
+    last = None
+    for i in range(attempts):
+        try:
+            return fn()
+        except Exception as e:
+            last = e
+            if not _is_transient(e):
+                raise
+            if i == attempts - 1:
+                break
+            delay = base_delay * (2 ** i)
+            logger.warning(
+                f"{what}: transient failure ({type(e).__name__}), "
+                f"retry {i+1}/{attempts-1} in {delay:.1f}s"
+            )
+            _time.sleep(delay)
+    logger.error(f"{what}: FAILED after {attempts} attempts: {last}")
+    raise last
+
+
+# ---------------------------------------------------------------------------
 # LANDS - paginated, ordered, complete
 # ---------------------------------------------------------------------------
 def iter_lands(tenant_id: Optional[str] = None) -> Iterator[Dict]:
@@ -113,9 +165,11 @@ def upsert_observations(rows: List[Dict]) -> int:
     if not rows:
         return 0
     try:
-        supabase.table("ndvi_data").upsert(
-            rows, on_conflict="land_id,scene_id"
-        ).execute()
+        with_retry(
+            lambda: supabase.table("ndvi_data")
+                    .upsert(rows, on_conflict="land_id,scene_id").execute(),
+            what=f"upsert {len(rows)} observation(s) for land {rows[0].get('land_id')}",
+        )
         return len(rows)
     except Exception:
         logger.exception(f"upsert failed for {len(rows)} rows "
@@ -166,9 +220,14 @@ def update_land_snapshot(*, land_id: str, ndvi_value, acquisition_date,
         data["ndvi_geotiff_url"] = geotiff_url
 
     try:
-        supabase.table("lands").update(data).eq("id", land_id).execute()
-    except Exception:
-        logger.exception(f"snapshot update failed for {land_id}")
+        with_retry(
+            lambda: supabase.table("lands").update(data).eq("id", land_id).execute(),
+            what=f"lands snapshot update {land_id}",
+        )
+    except Exception as e:
+        # Log the message, not a 60-line HTTP traceback. The traceback told us
+        # nothing the message doesn't, and it buried the actual run outcome.
+        logger.error(f"snapshot update failed for {land_id}: {type(e).__name__}: {e}")
 
 
 def mark_land_status(land_id: str, status: str, note: str = None) -> None:
@@ -201,9 +260,11 @@ def log_step(*, processing_step: str, step_status: str, tenant_id: str = None,
             "error_message": error_message,
             "metadata": metadata or {},
         }
-        supabase.table("ndvi_processing_logs").insert(
-            {k: v for k, v in payload.items() if v is not None}
-        ).execute()
+        with_retry(
+            lambda: supabase.table("ndvi_processing_logs")
+                    .insert({k: v for k, v in payload.items() if v is not None}).execute(),
+            what=f"log insert [{processing_step}]", attempts=2,
+        )
     except Exception as e:
         logger.warning(f"log insert failed [{processing_step}]: {e}")
 
