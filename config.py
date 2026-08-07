@@ -83,6 +83,12 @@ SCL_DARK         = [2]              # dark area / topographic shadow
 FIELD_BUFFER_M = -10.0              # one S2 pixel inward
 MIN_BUFFERED_AREA_M2 = 400.0        # below this, erosion would erase the field
 
+# all_touched fallback threshold. Strict centre-based clipping is used first;
+# all_touched is only enabled when it returns fewer than this many pixels.
+# Measured: global all_touched sampled 181% of field area on sub-0.5-acre
+# fields (worst 210%) - i.e. most sampled pixels were outside the boundary.
+ALL_TOUCHED_FALLBACK_PIXELS = 12
+
 # ---------------------------------------------------------------------------
 # ACCEPTANCE THRESHOLDS  (P-13, C-13)
 # ---------------------------------------------------------------------------
@@ -128,7 +134,10 @@ QUALITY_SATURATION_PIXELS = 50
 # v2 computes the Radar Vegetation Index from calibrated gamma0 into its OWN
 # column - never mixed into ndvi_value.
 ENABLE_S1_FALLBACK = True
-S1_MIN_VALID_PIXELS = 12
+# Aligned with MIN_VALID_PIXELS. Previously 12 while the optical gate was
+# lowered to 8, so radar silently kept the stricter rule - the 2026-08-07 run
+# still logged "valid_pixels 8 < 12" after the optical threshold had moved.
+S1_MIN_VALID_PIXELS = 8
 
 # ---------------------------------------------------------------------------
 # SCALE / CONCURRENCY  (P-08)

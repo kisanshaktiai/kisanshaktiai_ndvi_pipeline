@@ -34,6 +34,8 @@ from sar_vegetation import rvi_from_gamma0
 from quality import assess
 from config import (
     NDVI_DECIMALS, ENABLE_S1_FALLBACK, SCENE_WORKERS, NDVI_HISTOGRAM_BINS,
+    QUALITY_SATURATION_PIXELS, MICRO_LAND_ACRES, MICRO_LAND_FACTOR,
+    GEOMETRY_CONFIDENCE_FACTOR,
 )
 from logger import logger
 
@@ -357,6 +359,22 @@ def _process_s1(land: dict, geom_buffered, buffer_applied: bool,
         vh, _, _ = read_band(item, assets["vh"], geom_buffered, reference=ref)
 
         res = rvi_from_gamma0(vv, vh)
+
+        # Pixel-support factor, mirroring quality.assess() for optical.
+        # Saturates at QUALITY_SATURATION_PIXELS so a 2000-pixel field is not
+        # rewarded indefinitely, but a 15-pixel field is honestly discounted.
+        _px = res.get("valid_pixels") or 0
+        _s1_quality = 0.50 * min(_px / QUALITY_SATURATION_PIXELS, 1.0)
+
+        # Decision confidence discounts further for micro-land and for
+        # geometry provenance - the same factors optical rows carry.
+        _area = land.get("area_acres")
+        _s1_confidence = _s1_quality * 0.70
+        if _area is not None and _area < MICRO_LAND_ACRES:
+            _s1_confidence *= MICRO_LAND_FACTOR
+        _s1_confidence *= GEOMETRY_CONFIDENCE_FACTOR.get(geom_conf, 0.5)
+        _s1_confidence = min(_s1_confidence, _s1_quality)   # DB CHECK invariant
+
         if not res["accepted"]:
             logger.info(f"REJECT radar | land={land['id']} | {res['reject_reason']}")
             return []
@@ -386,14 +404,16 @@ def _process_s1(land: dict, geom_buffered, buffer_applied: bool,
             "spatial_resolution": 10,
 
             "valid_pixels": res["valid_pixels"],
-            # Radar is a structural proxy, not an optical measurement.
-            # quality describes the measurement; confidence describes how far
-            # a decision may lean on it. Both are capped, and confidence is
-            # discounted further because RVI cannot separate chlorophyll from
-            # canopy structure. The DB enforces confidence <= quality.
-            "quality_score": 0.50,
-            "confidence_score": 0.35,
-            "confidence_level": "medium",
+            # Radar is a structural proxy, not an optical measurement, so
+            # quality is CAPPED at 0.50 - but it must still VARY with pixel
+            # support. The 2026-08-07 run wrote 0.50/0.35 to all 28 rows, so a
+            # 15-pixel observation and a 2211-pixel observation were
+            # indistinguishable: exactly the defect v1 was faulted for.
+            "quality_score": _r(_s1_quality, 3),
+            "confidence_score": _r(_s1_confidence, 3),
+            "confidence_level": ("high" if _s1_confidence >= 0.40
+                                 else "medium" if _s1_confidence >= 0.25
+                                 else "low"),
             "geometry_confidence": geom_conf,
             "buffer_applied": buffer_applied,
             "metadata": {

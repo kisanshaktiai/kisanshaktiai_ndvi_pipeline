@@ -27,7 +27,7 @@ from pyproj import Transformer, CRS
 from config import (
     SCL_CROP_SURFACE, SCL_CLOUD, SCL_SHADOW, SCL_WATER,
     SCL_SATURATED, SCL_SNOW, SCL_DARK,
-    FIELD_BUFFER_M, MIN_BUFFERED_AREA_M2,
+    FIELD_BUFFER_M, MIN_BUFFERED_AREA_M2, ALL_TOUCHED_FALLBACK_PIXELS,
 )
 from logger import logger
 
@@ -132,19 +132,36 @@ def read_band(item, band_key: str, geometry, reference=None, categorical=False):
     with rasterio.open(asset.href) as src:
         geom_proj = reproject_geometry(geometry, src.crs)
 
-        # all_touched=True includes any pixel the polygon intersects, not
-        # only those whose CENTRE falls inside it. Two lands returned
-        # valid_px=0/0 on the 20 m SCL band: a 0.23-acre field after a -10 m
-        # buffer can be smaller than one 20 m SCL pixel, so centre-based
-        # rasterisation selected nothing and the field vanished silently.
-        # For fields of this size the polygon IS roughly one pixel; including
-        # touched pixels is the only way to sample them at all, and the
-        # micro-land confidence penalty carries the resulting uncertainty.
-        data, transform = rio_mask(
-            src, [mapping(geom_proj)],
-            crop=True, filled=True, all_touched=True,
-            nodata=src.nodata if src.nodata is not None else 0,
-        )
+        # all_touched: ADAPTIVE, not global.
+        #
+        # Measured on the 2026-08-07 run with all_touched=True everywhere:
+        #     fields < 0.5 acre  -> 181% of field area sampled (worst 210%)
+        #     fields 0.5-2 acre  ->  89%
+        #     fields > 2 acre    ->  88%
+        #
+        # On smallholdings MORE THAN HALF the sampled pixels lay OUTSIDE the
+        # boundary - neighbouring crops, bunds and tracks. That is precisely
+        # the mixed-pixel contamination the -10 m negative buffer exists to
+        # remove, reintroduced on the fields least able to tolerate it.
+        #
+        # But centre-only rasterisation makes tiny fields vanish entirely
+        # (two lands returned valid_px=0/0 on the 20 m SCL band).
+        #
+        # Resolution: use all_touched ONLY when centre-based sampling yields
+        # too few pixels to work with. Large fields keep strict containment;
+        # tiny fields get a sample at all, flagged via geometry/micro-land
+        # discounting rather than silently mixed in.
+        def _clip(at: bool):
+            return rio_mask(
+                src, [mapping(geom_proj)],
+                crop=True, filled=True, all_touched=at,
+                nodata=src.nodata if src.nodata is not None else 0,
+            )
+
+        data, transform = _clip(False)
+        _arr = data[0] if data.ndim == 3 else data
+        if int(np.count_nonzero(np.isfinite(_arr) & (_arr != 0))) < ALL_TOUCHED_FALLBACK_PIXELS:
+            data, transform = _clip(True)
         data = data[0] if data.ndim == 3 else data
 
         if categorical:

@@ -106,10 +106,16 @@ def iter_lands(tenant_id: Optional[str] = None) -> Iterator[Dict]:
 
     while True:
         q = (supabase.table("lands")
+             # boundary_geom is the PostGIS column and is populated on 29 of
+             # 29 active lands, but was never selected - so every observation
+             # in the 2026-08-07 run carried geometry_confidence='medium',
+             # silently falling back to the legacy jsonb. PostgREST returns
+             # geometry as GeoJSON, which shapely.shape() consumes directly.
              .select("id, tenant_id, area_acres, area_guntas, current_crop, "
-                     "current_crop_id, boundary_polygon_old, mgrs_tile_id, "
-                     "tile_id, center_lat, center_lon, crop_cycle, "
-                     "transplant_date, planting_date, last_sowing_date, das")
+                     "current_crop_id, boundary_geom, boundary_polygon_old, "
+                     "mgrs_tile_id, tile_id, center_lat, center_lon, "
+                     "crop_cycle, transplant_date, planting_date, "
+                     "last_sowing_date, das")
              .eq("is_active", True)
              .is_("deleted_at", None)
              .order("id")
