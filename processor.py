@@ -1,56 +1,63 @@
 """
 processor.py - per-acquisition field processing.
 
-THE CENTRAL ARCHITECTURAL CHANGE OF v2.
+ONE ROW PER ACQUISITION. Every statistic in a row is spatial, computed over
+the same buffered field on the same scene at the same instant. Temporal
+analysis happens downstream over rows.
 
-v1 collapsed every scene in a 15-day window into ONE row (mean 3.57 scenes),
-stamped it with date.today(), and mixed temporal and spatial statistics in
-the same record:
-
-    ndvi_value = nanmean(ndvi_series)      # TEMPORAL, across scenes
-    min_ndvi   = nanmin(ndvi_series)       # TEMPORAL, across scenes
-    ndvi_std   = nanstd(ndvi_raster)       # SPATIAL, one arbitrary scene
-    median     = nanmedian(ndvi_raster)    # SPATIAL, one arbitrary scene
-
-Proof of incoherence from production: 53.8% of rows have median_ndvi outside
-[min_ndvi, max_ndvi] - mathematically impossible if they shared a frame. And
-avg(max-min) = 0.0538 is SMALLER than avg(ndvi_std) = 0.0734: the "range"
-is narrower than the standard deviation.
-
-v2 emits ONE ROW PER ACQUISITION. Every statistic in a row is spatial,
-computed over the same buffered field on the same scene at the same instant.
-Temporal analysis is done downstream over rows, where it belongs.
+v2.2 CHANGES (forensic audit 2026-08-29)
+----------------------------------------
+F-1  Field footprint comes from the 10 m reference band's rasterio mask and
+     is passed to scl_masks(); out-of-polygon cells can no longer be counted.
+     A pixel-count plausibility gate refuses any observation whose field
+     pixel count exceeds what the surveyed area can physically contain.
+F-5  One physical Sentinel-2 acquisition arriving in two overlapping MGRS
+     tiles (same datetime + relative orbit) is processed ONCE: the tile whose
+     footprint contains the field is preferred.
+F-8/F-10  Handled in raster_utils (NaN fill, no clipping of negatives).
+NEW  Temporal plausibility flag: |delta NDVI| > TEMPORAL_MAX_DELTA against
+     any stored optical observation within TEMPORAL_WINDOW_DAYS is recorded
+     in metadata.temporal_outlier (flag, not rejection - harvest and
+     flooding are real).
+NEW  Per-scene exceptions are reported to the caller (scene_errors) so they
+     reach ndvi_processing_logs instead of a console warning only.
 """
 
-from typing import List, Optional
+from typing import List, Optional, Tuple
 import time
 import numpy as np
 from shapely.geometry import shape
 
 from sentinel_search import search_s2, search_s1, acquisition_meta
-from raster_utils import read_band, scl_masks, apply_crop_mask, buffered_field, resolve_geometry
+from raster_utils import (read_band, scl_masks, apply_crop_mask,
+                          buffered_field, resolve_geometry)
 from indices import compute_indices, validate_index, index_statistics
 from sar_vegetation import rvi_from_gamma0
 from quality import assess
 from config import (
-    NDVI_DECIMALS, ENABLE_S1_FALLBACK, SCENE_WORKERS, NDVI_HISTOGRAM_BINS,
+    NDVI_DECIMALS, ENABLE_S1_FALLBACK, NDVI_HISTOGRAM_BINS,
     QUALITY_SATURATION_PIXELS, MICRO_LAND_ACRES, MICRO_LAND_FACTOR,
-    GEOMETRY_CONFIDENCE_FACTOR,
+    GEOMETRY_CONFIDENCE_FACTOR, PIXEL_AREA_M2, PIXEL_COUNT_TOLERANCE,
+    DEDUPE_TILE_OVERLAP, TEMPORAL_MAX_DELTA, TEMPORAL_WINDOW_DAYS,
+    CLOUD_DILATION_PX,
 )
 from logger import logger
+
+PIPELINE_VERSION = "v2.2"
 
 # 10 m reference bands + the 20 m bands we resample onto them.
 S2_BANDS_10M = ["B02", "B03", "B04", "B08"]
 S2_BANDS_20M = ["B05", "B11"]
 
+INDEX_COLUMNS = (
+    ("NDVI",  "ndvi"),  ("SAVI",  "savi"),  ("EVI",   "evi"),
+    ("NDRE",  "ndre"),  ("MCARI", "mcari"), ("NDMI",  "ndmi"),
+    ("NDWI",  "ndwi"),  ("MNDWI", "mndwi_water"),
+)
+
 
 def _r(x, nd=NDVI_DECIMALS):
-    """Round that treats 0.0 correctly.
-
-    v1 used `round(x, n) if result.get(x) else None`, which is falsy for 0.0
-    and silently NULLed a genuine ndvi_std of exactly 0 (uniform field) or a
-    median of 0 (bare soil). (P-10)
-    """
+    """Round that treats 0.0 correctly and refuses non-finite values."""
     if x is None:
         return None
     try:
@@ -62,9 +69,68 @@ def _r(x, nd=NDVI_DECIMALS):
     return round(v, nd)
 
 
+def max_plausible_pixels(area_m2: float) -> int:
+    """Upper bound on 10 m cells a field of `area_m2` can contain (F-1 gate)."""
+    if not area_m2 or area_m2 <= 0:
+        return 0
+    return int(np.ceil(area_m2 / PIXEL_AREA_M2 * PIXEL_COUNT_TOLERANCE)) + 2
+
+
+# ---------------------------------------------------------------------------
+# TILE-OVERLAP DEDUPLICATION  (F-5)
+# ---------------------------------------------------------------------------
+def dedupe_acquisitions(items: List, field_geom) -> List:
+    """
+    Collapse STAC items that are the SAME physical acquisition delivered in
+    overlapping MGRS tiles. Key = (datetime, relative orbit, platform).
+    Preference: the tile whose footprint contains the whole field, then the
+    one with the larger intersection, then STAC order.
+    """
+    if not DEDUPE_TILE_OVERLAP:
+        return items
+    groups = {}
+    order = []
+    for it in items:
+        p = it.properties
+        key = (str(it.datetime), p.get("sat:relative_orbit"), p.get("platform"))
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append(it)
+
+    kept = []
+    for key in order:
+        cands = groups[key]
+        if len(cands) == 1:
+            kept.append(cands[0])
+            continue
+
+        def score(it):
+            try:
+                g = shape(it.geometry)
+                if g.contains(field_geom):
+                    return 2.0 + g.intersection(field_geom).area
+                return g.intersection(field_geom).area
+            except Exception:
+                return 0.0
+
+        best = max(cands, key=score)
+        kept.append(best)
+        logger.info(
+            f"Tile overlap: {len(cands)} items for {key[0]} orbit {key[1]}; "
+            f"using {best.id}"
+        )
+    return kept
+
+
+# ---------------------------------------------------------------------------
+# SENTINEL-2
+# ---------------------------------------------------------------------------
 def process_acquisition(item, geom_buffered, buffer_applied: bool,
                         land: dict, geom_conf: str = "high",
-                        reject_sink: Optional[list] = None) -> Optional[dict]:
+                        raw_area_m2: float = None,
+                        reject_sink: Optional[list] = None,
+                        error_sink: Optional[list] = None) -> Optional[dict]:
     """
     Process ONE Sentinel-2 acquisition over ONE field.
     Returns a complete row dict, or None if the acquisition is rejected.
@@ -73,44 +139,45 @@ def process_acquisition(item, geom_buffered, buffer_applied: bool,
     _t0 = time.time()
 
     try:
-        # --- reference grid: B04 at 10 m -------------------------------
-        # Reference grid: B04 at 10 m. The CRS MUST be carried through -
-        # passing None here made reproject() raise "Missing dst_crs" on every
-        # band of every scene, which surfaced as a total data outage rather
-        # than the one-line contract bug it was.
-        b04, ref_transform, ref_crs = read_band(item, "B04", geom_buffered)
-        ref = (b04.shape, ref_transform, ref_crs)
+        # --- reference grid: B04 at 10 m, WITH its footprint -----------
+        b04, ref_transform, ref_crs, footprint = read_band(item, "B04", geom_buffered)
+        ref = (b04.shape, ref_transform, ref_crs, footprint)
 
-        with_ref = {}
+        with_ref = {"B04": b04}
         for bk in S2_BANDS_10M:
-            if bk == "B04":
-                with_ref[bk] = b04
-            else:
-                with_ref[bk], _, _ = read_band(item, bk, geom_buffered, reference=ref)
+            if bk != "B04":
+                with_ref[bk], _, _, _ = read_band(item, bk, geom_buffered, reference=ref)
 
         for bk in S2_BANDS_20M:
             try:
-                with_ref[bk], _, _ = read_band(item, bk, geom_buffered, reference=ref)
+                with_ref[bk], _, _, _ = read_band(item, bk, geom_buffered, reference=ref)
             except Exception as e:
                 logger.debug(f"Band {bk} unavailable on {meta['scene_id']}: {e}")
 
-        # --- SCL: NEAREST resampling (P-04 fix) ------------------------
-        scl, _, _ = read_band(item, "SCL", geom_buffered, reference=ref, categorical=True)
+        # --- SCL: nearest resampling, padded+dilated in read_band -------
+        scl, _, _, _ = read_band(item, "SCL", geom_buffered, reference=ref, categorical=True)
 
-        masks = scl_masks(scl)
-        qa = assess(
-            masks,
-            buffer_applied,
-            area_acres=land.get("area_acres"),
-            geometry_confidence=geom_conf,
-        )
+        masks = scl_masks(scl, footprint=footprint)
+
+        # --- F-1 PLAUSIBILITY GATE --------------------------------------
+        # A footprint larger than the surveyed area can hold is impossible
+        # and would mean out-of-polygon cells are being counted.
+        max_px = max_plausible_pixels(raw_area_m2)
+        if raw_area_m2 and masks["n_field_pixels"] > max_px:
+            reason = (f"field_pixels {masks['n_field_pixels']} > plausible "
+                      f"{max_px} for {raw_area_m2:.0f} m2")
+            logger.error(f"REJECT optical | land={land['id']} scene={meta['scene_id']} | {reason}")
+            if reject_sink is not None:
+                reject_sink.append({"scene_id": meta["scene_id"],
+                                    "acquisition_date": meta["acquisition_date"],
+                                    "reason": reason})
+            return None
+
+        qa = assess(masks, buffer_applied,
+                    area_acres=land.get("area_acres"),
+                    geometry_confidence=geom_conf)
 
         if not qa.accepted:
-            # INFO, not DEBUG. The first live run rejected 100% of optical
-            # acquisitions on all 29 lands and the reason was invisible at
-            # LOG_LEVEL=INFO - indistinguishable from a bug. A rejection
-            # without a stated reason is the exact failure mode this pipeline
-            # exists to remove.
             logger.info(
                 f"REJECT optical | land={land['id']} scene={meta['scene_id']} "
                 f"| {qa.reject_reason} "
@@ -135,7 +202,7 @@ def process_acquisition(item, geom_buffered, buffer_applied: bool,
                 })
             return None
 
-        # --- indices over crop-surface pixels only ---------------------
+        # --- indices over crop-surface pixels only ----------------------
         masked = apply_crop_mask(with_ref, masks)
         idx = compute_indices(masked)
 
@@ -143,11 +210,10 @@ def process_acquisition(item, geom_buffered, buffer_applied: bool,
             "land_id": land["id"],
             "tenant_id": land["tenant_id"],
 
-            # ---- TRUE PROVENANCE (all NULL in v1) --------------------
             "scene_id": meta["scene_id"],
             "acquisition_time": meta["acquisition_time"],
             "acquisition_date": meta["acquisition_date"],
-            "date": meta["acquisition_date"],     # legacy col = TRUE date now
+            "date": meta["acquisition_date"],
             "cloud_cover": _r(qa.cloud_fraction * 100.0, 2),
             "scene_cloud_cover": meta["scene_cloud_cover"],
             "tile_id": meta["mgrs_tile"],
@@ -155,12 +221,11 @@ def process_acquisition(item, geom_buffered, buffer_applied: bool,
             "platform": meta["platform"],
             "processing_baseline": meta["processing_baseline"],
 
-            # ---- OBSERVATION SEMANTICS (new, non-negotiable) ---------
             "observation_source": "sentinel-2",
-            "observation_type": "observed",       # NEVER interpolated
+            "observation_type": "observed",
             "is_interpolated": False,
+            "source_scene_count": 1,
 
-            # ---- QUALITY (NULL in 99.84% of v1 rows) -----------------
             "quality_score": qa.quality_score,
             "confidence_score": qa.confidence_score,
             "confidence_level": qa.confidence_level,
@@ -181,22 +246,7 @@ def process_acquisition(item, geom_buffered, buffer_applied: bool,
             "spatial_resolution": 10,
         }
 
-        # ---- SPATIAL statistics, all from THIS acquisition -----------
-        # Every statistic here is SPATIAL: computed over the valid pixels of
-        # one field on one acquisition. No temporal aggregation happens
-        # anywhere in this pipeline. v1 mixed the two frames in one row and
-        # 53.8% of its rows were mathematically impossible as a result.
-        #
-        # DETERMINISM: fixed iteration order, nan-aware numpy reductions,
-        # no sampling. Identical imagery yields bit-identical output, which
-        # the Decision Brain requires.
-        INDEX_COLUMNS = (
-            ("NDVI",  "ndvi"),  ("SAVI",  "savi"),  ("EVI",   "evi"),
-            ("NDRE",  "ndre"),  ("MCARI", "mcari"), ("NDMI",  "ndmi"),
-            ("NDWI",  "ndwi"),  ("MNDWI", "mndwi_water"),
-        )
         index_quality = {}
-
         for name, col in INDEX_COLUMNS:
             arr = idx.get(name)
             if arr is None:
@@ -204,51 +254,34 @@ def process_acquisition(item, geom_buffered, buffer_applied: bool,
             st = index_statistics(arr)
             if not st:
                 continue
-
             ok, why = validate_index(name, st["mean"])
             index_quality[name] = {"valid": ok, "reason": why, "pixels": st["count"]}
             if not ok:
-                logger.warning(
-                    f"{name} rejected ({why}, mean={st['mean']}) on "
-                    f"{meta['scene_id']} land {land['id']}"
-                )
+                logger.warning(f"{name} rejected ({why}, mean={st['mean']}) on "
+                               f"{meta['scene_id']} land {land['id']}")
                 continue
 
             row[f"{col}_value" if col != "mndwi_water" else "mndwi_water"] = _r(st["mean"])
 
-            # NDVI carries the full distribution: it drives stage-relative
-            # interpretation and within-field heterogeneity downstream.
             if name == "NDVI":
+                # The NDVI pixel population MUST equal the crop-pixel count;
+                # a shortfall means NaN bands leaked in and the row is not
+                # describing the field it claims to.
+                if st["count"] < qa.valid_pixels:
+                    row["valid_pixels"] = st["count"]
+                    row["coverage_percentage"] = _r(100.0 * st["count"] / max(qa.field_pixels, 1), 2)
                 row["ndvi_spatial_min"]    = _r(st["min"])
                 row["ndvi_spatial_max"]    = _r(st["max"])
                 row["ndvi_spatial_std"]    = _r(st["std"])
                 row["ndvi_spatial_median"] = _r(st["median"])
                 row["ndvi_p10"]            = _r(st["p10"])
                 row["ndvi_p90"]            = _r(st["p90"])
-                # Coefficient of variation: THE differential splitter.
-                #   uniform low -> whole-field cause (nutrient, water)
-                #   patchy  low -> localised cause (pest, disease, soil)
                 row["uniformity_cv"]       = _r(st["cv"], 4)
-
-                # ---- PER-FIELD HISTOGRAM ----------------------------
-                # Adopted from the retired engine repo, which stored a
-                # 20-bin distribution rather than summary stats alone.
-                # ~200 bytes, and percentiles/uniformity/bimodality stay
-                # recomputable later without touching imagery again.
-                #
-                # DIFFERENCE THAT MATTERS: that repo built ONE histogram
-                # per 12,060 km2 MGRS tile and weighted it to fields by
-                # overlap ratio. A 5-acre field is 0.00017% of such a
-                # tile, so the histogram described a river basin. This one
-                # covers the BUFFERED FIELD only.
                 finite = arr[np.isfinite(arr)]
                 if finite.size:
-                    counts, edges = np.histogram(
-                        finite, bins=NDVI_HISTOGRAM_BINS, range=(-1.0, 1.0))
-                    row["ndvi_histogram"] = {
-                        "bins": [round(float(e), 3) for e in edges],
-                        "counts": [int(c) for c in counts],
-                    }
+                    counts, edges = np.histogram(finite, bins=NDVI_HISTOGRAM_BINS, range=(-1.0, 1.0))
+                    row["ndvi_histogram"] = {"bins": [round(float(e), 3) for e in edges],
+                                             "counts": [int(c) for c in counts]}
 
         if "ndvi_value" not in row:
             return None
@@ -265,85 +298,131 @@ def process_acquisition(item, geom_buffered, buffer_applied: bool,
                 "saturated": qa.saturated_fraction,
                 "unaccounted": qa.unaccounted_fraction,
             },
-            "pipeline_version": "v2.1",
+            "footprint": {
+                "field_pixels": qa.field_pixels,
+                "max_plausible_pixels": max_px,
+                "raw_area_m2": round(raw_area_m2, 1) if raw_area_m2 else None,
+                "cloud_dilation_px": CLOUD_DILATION_PX,
+            },
+            "pipeline_version": PIPELINE_VERSION,
         }
         return row
 
     except Exception as e:
-        logger.warning(
-            f"Acquisition {meta.get('scene_id')} failed for land {land['id']}: {e}"
-        )
+        logger.warning(f"Acquisition {meta.get('scene_id')} failed for land {land['id']}: {e}")
+        if error_sink is not None:
+            error_sink.append({"scene_id": meta.get("scene_id"),
+                               "acquisition_date": meta.get("acquisition_date"),
+                               "error": f"{type(e).__name__}: {str(e)[:300]}"})
         return None
 
 
+# ---------------------------------------------------------------------------
+# TEMPORAL PLAUSIBILITY  (flag only)
+# ---------------------------------------------------------------------------
+def flag_temporal_outliers(rows: List[dict], history: List[dict]) -> None:
+    """
+    history: [{acquisition_date: 'YYYY-MM-DD', ndvi_value: float}, ...] from
+    the DB (previous optical observations). Rows are compared against history
+    AND against each other. Sets metadata.temporal_outlier / temporal_ref.
+    """
+    from datetime import date as _date
+    pts = [(r["acquisition_date"], r["ndvi_value"]) for r in history
+           if r.get("ndvi_value") is not None and r.get("acquisition_date")]
+    pts += [(r["acquisition_date"], r["ndvi_value"]) for r in rows
+            if r.get("ndvi_value") is not None]
+    for r in rows:
+        if r.get("ndvi_value") is None:
+            continue
+        d0 = _date.fromisoformat(r["acquisition_date"])
+        worst = None
+        for d, v in pts:
+            if d == r["acquisition_date"]:
+                continue
+            dd = abs((_date.fromisoformat(d) - d0).days)
+            if 0 < dd <= TEMPORAL_WINDOW_DAYS:
+                delta = abs(float(v) - float(r["ndvi_value"]))
+                if delta > TEMPORAL_MAX_DELTA and (worst is None or delta > worst[1]):
+                    worst = (d, delta)
+        r.setdefault("metadata", {})["temporal_outlier"] = worst is not None
+        if worst:
+            r["metadata"]["temporal_ref"] = {"date": worst[0], "abs_delta": round(worst[1], 4)}
+            logger.warning(f"Land {r['land_id']} {r['acquisition_date']}: NDVI jump "
+                           f"{worst[1]:.2f} vs {worst[0]} flagged temporal_outlier")
+
+
+# ---------------------------------------------------------------------------
+# PER-LAND DRIVER
+# ---------------------------------------------------------------------------
 def process_land(land: dict, lookback_days: int = None,
-                 scenes: Optional[List] = None) -> List[dict]:
+                 scenes: Optional[List] = None,
+                 history: Optional[List[dict]] = None) -> Tuple[List[dict], dict]:
     """
-    scenes: pre-fetched STAC items from tile_grouping.scenes_for_group().
-    Passing them avoids one STAC search per land - the ~2000x scaling win
-    the retired engine repo was reaching for. When None, falls back to a
-    per-land search.
+    Returns (rows, report). rows: one per accepted acquisition.
+    report: {"optical_rejects": [...], "scene_errors": [...], "items": n,
+             "deduped": n, "geometry_confidence": str}
+    scenes: pre-fetched STAC items (tile group). None -> per-land search.
     """
-    """
-    Returns a LIST of rows - one per accepted acquisition.
-    v1 returned at most one row per land per run.
-    """
-    # Geometry with an honest confidence label, adopted from the retired
-    # engine repo (land_geometry.resolve_land_geometry). It degrades to a
-    # centroid buffer rather than refusing - but labels that 'low' so the
-    # quality score can discount it instead of pretending it is a survey.
+    report = {"optical_rejects": [], "scene_errors": [], "items": 0,
+              "deduped": 0, "geometry_confidence": None}
+
     try:
         geom, geom_conf = resolve_geometry(land)
     except Exception as e:
         logger.error(f"No usable geometry for land {land['id']}: {e}")
-        return []
+        report["scene_errors"].append({"error": f"geometry: {e}"})
+        return [], report
+    report["geometry_confidence"] = geom_conf
 
-    geom_buf, buffer_applied, area_m2 = buffered_field(geom)
+    geom_buf, buffer_applied, raw_area_m2 = buffered_field(geom)
 
     items = scenes if scenes is not None else search_s2(geom, days=lookback_days)
+    report["items"] = len(items)
+    items = dedupe_acquisitions(items, geom)
+    report["deduped"] = report["items"] - len(items)
+
     rows = []
-    rejects: List[dict] = []
     for item in items:
         r = process_acquisition(item, geom_buf, buffer_applied, land, geom_conf,
-                                reject_sink=rejects)
+                                raw_area_m2=raw_area_m2,
+                                reject_sink=report["optical_rejects"],
+                                error_sink=report["scene_errors"])
         if r:
-            r["field_area_m2"] = round(area_m2, 1)
+            r["field_area_m2"] = round(raw_area_m2, 1)
             rows.append(r)
 
     if rows:
+        flag_temporal_outliers(rows, history or [])
         logger.info(
             f"Land {land['id']}: {len(rows)}/{len(items)} acquisitions accepted "
             f"(dates {rows[-1]['acquisition_date']} .. {rows[0]['acquisition_date']})"
         )
-        return rows
+        return rows, report
 
-    # ---- OPTICAL FAILED -> SENTINEL-1 FALLBACK ------------------------
-    # This is what keeps the platform alive through the monsoon instead of
-    # going 100% blind as it did in July-August 2026.
     if not ENABLE_S1_FALLBACK:
-        return []
+        return [], report
 
-    # Aggregate WHY optical failed, so a monsoon rejection is instantly
-    # distinguishable from a processing bug.
+    rejects = report["optical_rejects"]
     if rejects:
         reasons = {}
         for r in rejects:
-            key = (r["reason"] or "unknown").split()[0]
+            key = (r.get("reason") or "unknown").split()[0]
             reasons[key] = reasons.get(key, 0) + 1
-        logger.info(
-            f"Land {land['id']}: optical 0/{len(items)} accepted | "
-            f"reasons={reasons} | "
-            f"mean_field_cloud={sum(r['cloud_fraction'] for r in rejects)/len(rejects):.0%}"
-        )
+        cf = [r["cloud_fraction"] for r in rejects if r.get("cloud_fraction") is not None]
+        logger.info(f"Land {land['id']}: optical 0/{len(items)} accepted | reasons={reasons}"
+                    + (f" | mean_field_cloud={sum(cf)/len(cf):.0%}" if cf else ""))
     logger.info(f"Land {land['id']}: no usable optical data, trying Sentinel-1")
-    s1 = _process_s1(land, geom_buf, buffer_applied, geom_conf)
+    s1 = _process_s1(land, geom_buf, buffer_applied, geom_conf, raw_area_m2, report)
     for row in s1:
         row.setdefault("metadata", {})["optical_rejects"] = rejects[:6]
-    return s1
+    return s1, report
 
 
+# ---------------------------------------------------------------------------
+# SENTINEL-1 FALLBACK
+# ---------------------------------------------------------------------------
 def _process_s1(land: dict, geom_buffered, buffer_applied: bool,
-                geom_conf: str = "high") -> List[dict]:
+                geom_conf: str, raw_area_m2: float, report: dict) -> List[dict]:
     pairs = search_s1(geom_buffered)
     if not pairs:
         return []
@@ -354,26 +433,28 @@ def _process_s1(land: dict, geom_buffered, buffer_applied: bool,
 
     try:
         assets = {k.lower(): k for k in item.assets}
-        vv, ref_transform, ref_crs = read_band(item, assets["vv"], geom_buffered)
-        ref = (vv.shape, ref_transform, ref_crs)
-        vh, _, _ = read_band(item, assets["vh"], geom_buffered, reference=ref)
+        vv, ref_transform, ref_crs, footprint = read_band(item, assets["vv"], geom_buffered)
+        ref = (vv.shape, ref_transform, ref_crs, footprint)
+        vh, _, _, _ = read_band(item, assets["vh"], geom_buffered, reference=ref)
+
+        max_px = max_plausible_pixels(raw_area_m2)
+        n_fp = int(np.count_nonzero(footprint))
+        if raw_area_m2 and n_fp > max_px:
+            logger.error(f"REJECT radar | land={land['id']} | footprint {n_fp} > plausible {max_px}")
+            return []
 
         res = rvi_from_gamma0(vv, vh)
-
-        # Pixel-support factor, mirroring quality.assess() for optical.
-        # Saturates at QUALITY_SATURATION_PIXELS so a 2000-pixel field is not
-        # rewarded indefinitely, but a 15-pixel field is honestly discounted.
         _px = res.get("valid_pixels") or 0
         _s1_quality = 0.50 * min(_px / QUALITY_SATURATION_PIXELS, 1.0)
-
-        # Decision confidence discounts further for micro-land and for
-        # geometry provenance - the same factors optical rows carry.
         _area = land.get("area_acres")
         _s1_confidence = _s1_quality * 0.70
         if _area is not None and _area < MICRO_LAND_ACRES:
             _s1_confidence *= MICRO_LAND_FACTOR
         _s1_confidence *= GEOMETRY_CONFIDENCE_FACTOR.get(geom_conf, 0.5)
-        _s1_confidence = min(_s1_confidence, _s1_quality)   # DB CHECK invariant
+        _s1_quality = round(_s1_quality, 3)
+        # strictly below quality by a float4-safe margin (F-2 guard)
+        _s1_confidence = round(min(_s1_confidence, _s1_quality - 1e-3), 3)
+        _s1_confidence = max(_s1_confidence, 0.0)
 
         if not res["accepted"]:
             logger.info(f"REJECT radar | land={land['id']} | {res['reject_reason']}")
@@ -386,41 +467,40 @@ def _process_s1(land: dict, geom_buffered, buffer_applied: bool,
             "acquisition_time": meta["acquisition_time"],
             "acquisition_date": meta["acquisition_date"],
             "date": meta["acquisition_date"],
-
-            # NDVI IS NULL HERE - BY DESIGN.
-            # A radar index is not an optical measurement and must never be
-            # written into ndvi_value.
             "ndvi_value": None,
             "rvi_value": res["rvi_mean"],
             "rvi_std": res["rvi_std"],
             "cross_ratio_db": res["cross_ratio_db"],
-
             "observation_source": "sentinel-1",
             "observation_type": "observed",
             "is_interpolated": False,
+            "source_scene_count": 1,
             "satellite_source": "sentinel-1",
             "collection_id": collection,
             "processing_level": "RTC" if "rtc" in collection else "GRD",
             "spatial_resolution": 10,
-
+            "relative_orbit": meta["relative_orbit"],
+            "platform": meta["platform"],
             "valid_pixels": res["valid_pixels"],
-            # Radar is a structural proxy, not an optical measurement, so
-            # quality is CAPPED at 0.50 - but it must still VARY with pixel
-            # support. The 2026-08-07 run wrote 0.50/0.35 to all 28 rows, so a
-            # 15-pixel observation and a 2211-pixel observation were
-            # indistinguishable: exactly the defect v1 was faulted for.
-            "quality_score": _r(_s1_quality, 3),
-            "confidence_score": _r(_s1_confidence, 3),
+            "total_pixels": n_fp,
+            "field_area_m2": round(raw_area_m2, 1),
+            "quality_score": _s1_quality,
+            "confidence_score": _s1_confidence,
             "confidence_level": ("high" if _s1_confidence >= 0.40
-                                 else "medium" if _s1_confidence >= 0.25
-                                 else "low"),
+                                 else "medium" if _s1_confidence >= 0.25 else "low"),
             "geometry_confidence": geom_conf,
             "buffer_applied": buffer_applied,
+            "processing_duration_ms": int((time.time() - _t0) * 1000),
             "metadata": {
                 "note": "optical unavailable (cloud); radar vegetation proxy",
-                "index": "RVI = 4*VH/(VV+VH)",
+                "index": "RVI = 4*VH/(VV+VH), linear gamma0, range [0,2]",
+                "vv_db_mean": res.get("vv_db_mean"),
+                "vh_db_mean": res.get("vh_db_mean"),
+                "pipeline_version": PIPELINE_VERSION,
             },
         }]
     except Exception as e:
         logger.warning(f"S1 processing failed for land {land['id']}: {e}")
+        report["scene_errors"].append({"scene_id": meta.get("scene_id"),
+                                       "error": f"S1 {type(e).__name__}: {str(e)[:300]}"})
         return []

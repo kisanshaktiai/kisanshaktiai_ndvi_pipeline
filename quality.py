@@ -17,6 +17,8 @@ refuses to persist anything below MIN_QUALITY_SCORE.
 
 from dataclasses import dataclass, asdict
 from typing import Optional
+import math
+import numpy as np
 
 from config import (
     MIN_VALID_PIXELS, MIN_VALID_FRACTION, MIN_QUALITY_SCORE,
@@ -107,7 +109,14 @@ def assess(masks: dict,
     # it should never carry the same weight as a surveyed polygon.
     score *= GEOMETRY_CONFIDENCE_FACTOR.get(geometry_confidence, 0.5)
 
-    confidence = round(min(max(score, 0.0), quality), 3)
+    # F-2 GUARD. ndvi_data.quality_score is float4 (real) in the live schema
+    # while confidence_score is numeric; the CHECK compares them with a
+    # 1e-9 tolerance. float4(0.704) == 0.703999996..., so an equal 3-dp pair
+    # violates the constraint and the whole land fails. Bound confidence by
+    # the float4 representation of quality, strictly below it.
+    q32 = float(np.float32(quality))
+    confidence = math.floor((min(max(score, 0.0), q32) - 1e-6) * 1e6) / 1e6
+    confidence = max(confidence, 0.0)
 
     reject = None
     # FIELD-LEVEL image-quality gates. This is "reject scenes exceeding the

@@ -1,33 +1,55 @@
 """
 raster_utils.py - band I/O, reflectance scaling, geometry, masking.
 
-v1 DEFECTS FIXED HERE:
-  P-04  Resampling.bilinear was applied to SCL, a CATEGORICAL raster. Class
-        codes were interpolated to fractional values (4.5, 6.25) which
-        np.isin then rejected. This destroyed ~69% of legitimate pixels -
-        the true cause of the 31% mean "coverage" - and could blend a
-        cloud edge (9) with vegetation (4) into exactly 6 or 7, which v1's
-        VALID_SCL accepted. v2 uses Resampling.nearest for SCL.
-  P-05  VALID_SCL = [4,5,6,7] admitted water and unclassified. Now [4,5],
-        imported from config, with cloud/shadow/water tracked separately.
-  P-12  No negative buffer. v2 erodes the polygon by one pixel.
-  P-17  Band scale was guessed from each clip's own max value, independently
-        per band, so two bands in one index could end up on different scales.
-        v2 reads scale/offset from STAC asset metadata.
+v2.2 CHANGES (forensic audit 2026-08-29, finding F-1 / F-8 / F-10)
+--------------------------------------------------------------------
+F-1  The field FOOTPRINT was defined as `SCL != 0`. SCL is a 20 m band; its
+     clip overhangs the 10 m reference grid, so reference cells OUTSIDE the
+     polygon received a real SCL class while B04/B08 held the nodata fill (0),
+     which to_reflectance turned into 0.0 and NDVI turned into exactly 0.0.
+     Live evidence: 16/16 optical rows had more pixels than the field area
+     allows and 13/16 had ndvi_spatial_min == 0.0. Means were biased low by
+     25-60 %.
+     FIX: read_band now returns the rasterio *mask* of the reference band
+     (True = inside polygon at 10 m). scl_masks() intersects SCL with it.
+     Nothing outside the surveyed boundary can be counted any more.
+
+F-8  Fill outside the polygon is now NaN (masked read), so bilinear
+     resampling of the 20 m bands (B05, B11) cannot blend zeros into edge
+     pixels. reproject() propagates NaN; the shared finite mask in indices.py
+     drops those cells.
+
+F-10 Negative surface reflectance (deep shadow / water after offset) is now
+     NaN, not 0.0. A pixel with no physical reflectance must not produce a
+     "valid" index value.
+
+CLOUD-EDGE DILATION (research-backed, new)
+     Sen2Cor's SCL under-detects cloud and shadow edges; production
+     time-series work routinely dilates the cloud/shadow mask by 1-6 pixels
+     (CMIX 2022; MDPI RS 14:4221 uses 120 m). We dilate cloud (8,9,10) and
+     cloud shadow (3) by CLOUD_DILATION_PX on the 10 m grid. Dilated pixels
+     are treated as cloud, so a field touched by a cloud edge is scored and
+     gated honestly rather than measured through haze.
+
+Earlier v1 fixes retained: SCL nearest resampling (P-04), SCL_CROP_SURFACE
+[4,5] from config (P-05), -10 m erosion (P-12), scale/offset from STAC
+metadata with baseline fallback (P-17).
 """
 
 import numpy as np
 import rasterio
 from rasterio.mask import mask as rio_mask
 from rasterio.warp import reproject, Resampling
+from scipy.ndimage import binary_dilation
 from shapely.ops import transform as shp_transform
-from shapely.geometry import mapping
+from shapely.geometry import mapping, Point
 from pyproj import Transformer, CRS
 
 from config import (
     SCL_CROP_SURFACE, SCL_CLOUD, SCL_SHADOW, SCL_WATER,
-    SCL_SATURATED, SCL_SNOW, SCL_DARK,
+    SCL_SATURATED, SCL_SNOW, SCL_DARK, SCL_CLOUD_SHADOW,
     FIELD_BUFFER_M, MIN_BUFFERED_AREA_M2, ALL_TOUCHED_FALLBACK_PIXELS,
+    CLOUD_DILATION_PX, REFLECTANCE_MAX,
 )
 from logger import logger
 
@@ -54,8 +76,8 @@ def buffered_field(geom):
     Erode the field by one Sentinel-2 pixel to suppress mixed edge pixels.
 
     Returns (geometry_wgs84, buffer_applied: bool, area_m2: float).
-    Tiny fields fall back to the raw polygon but are flagged so the quality
-    score can be downgraded - the caller must not treat them as equivalent.
+    area_m2 is ALWAYS the raw surveyed area (used for the pixel-count
+    plausibility check); the eroded geometry is what gets sampled.
     """
     utm = utm_crs_for(geom)
     fwd = Transformer.from_crs("EPSG:4326", utm, always_xy=True).transform
@@ -71,29 +93,28 @@ def buffered_field(geom):
         )
         return geom, False, raw_area
 
-    return shp_transform(inv, eroded), True, eroded.area
+    return shp_transform(inv, eroded), True, raw_area
 
 
 # ---------------------------------------------------------------------------
 # REFLECTANCE SCALING  (P-17)
 # ---------------------------------------------------------------------------
-def to_reflectance(data: np.ndarray, item, band_key: str) -> np.ndarray:
+def band_scale_offset(item, band_key: str):
     """
-    Convert raw DN to surface reflectance using STAC metadata.
+    (scale, offset) for a Sentinel-2 L2A asset.
 
-    Sentinel-2 processing baseline >= 04.00 (from 2022-01-25) applies
-    BOA_ADD_OFFSET = -1000, so reflectance = (DN + offset) / 10000.
-    Ignoring the offset biases every index; guessing the scale from pixel
-    statistics (v1) can put two bands of one index on different scales.
+    Planetary Computer does NOT harmonise the BOA_ADD_OFFSET introduced with
+    processing baseline 04.00 (2022-01-25); DN carry a +1000 shift. Prefer
+    STAC raster:bands metadata when present; otherwise fall back to the
+    baseline rule. Returned offset is what is ADDED before scaling.
     """
     scale, offset = 1.0 / 10000.0, 0.0
-
     try:
         raster_bands = item.assets[band_key].extra_fields.get("raster:bands")
         if raster_bands:
             rb = raster_bands[0]
-            scale = rb.get("scale", scale)
-            offset = rb.get("offset", offset)
+            scale = float(rb.get("scale", scale))
+            offset = float(rb.get("offset", offset))
     except Exception:
         pass
 
@@ -104,9 +125,22 @@ def to_reflectance(data: np.ndarray, item, band_key: str) -> np.ndarray:
                 offset = -1000.0
         except Exception:
             pass
+    return scale, offset
 
-    out = (data.astype("float32") + offset) * scale
-    return np.clip(out, 0.0, 1.6)
+
+def to_reflectance(data: np.ndarray, item, band_key: str) -> np.ndarray:
+    """
+    DN -> surface reflectance. Masked / nodata cells become NaN.
+    Physically impossible values (< 0 after offset, > REFLECTANCE_MAX)
+    become NaN rather than being clipped into a plausible-looking number.
+    """
+    scale, offset = band_scale_offset(item, band_key)
+    arr = np.ma.filled(data.astype("float32"), np.nan)
+    if np.ma.isMaskedArray(data):
+        arr[np.ma.getmaskarray(data)] = np.nan
+    out = (arr + offset) * scale
+    out[(out < 0.0) | (out > REFLECTANCE_MAX)] = np.nan
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -116,119 +150,138 @@ def read_band(item, band_key: str, geometry, reference=None, categorical=False):
     """
     Read one band clipped to `geometry`.
 
-    Returns (array, transform, crs). The CRS is part of the contract:
-    the caller assembles `reference = (shape, transform, crs)` and every
-    subsequent band is reprojected onto that exact grid. Omitting the CRS
-    makes reproject() raise "Missing dst_crs" on every band.
+    Returns (array, transform, crs, footprint).
+      footprint : bool ndarray, True where the cell is INSIDE the clip
+                  geometry on THIS band's grid (rasterio's own mask). For the
+                  reference band this is the authoritative field footprint.
+                  For reprojected bands it is the reference footprint.
 
-    categorical=True  -> nearest-neighbour resampling (SCL). THE P-04 FIX.
-    categorical=False -> bilinear, and DN converted to reflectance.
-
-    Outside-polygon pixels are filled with NaN (not 0 as in v1) so they can
-    never be mistaken for a real reflectance of zero.
+    categorical=True  -> nearest-neighbour resampling, int16, fill 0 (SCL).
+    categorical=False -> bilinear, float32, fill NaN, DN -> reflectance.
     """
     asset = item.assets[band_key]
 
     with rasterio.open(asset.href) as src:
         geom_proj = reproject_geometry(geometry, src.crs)
+        nodata = src.nodata if src.nodata is not None else 0
 
-        # all_touched: ADAPTIVE, not global.
-        #
-        # Measured on the 2026-08-07 run with all_touched=True everywhere:
-        #     fields < 0.5 acre  -> 181% of field area sampled (worst 210%)
-        #     fields 0.5-2 acre  ->  89%
-        #     fields > 2 acre    ->  88%
-        #
-        # On smallholdings MORE THAN HALF the sampled pixels lay OUTSIDE the
-        # boundary - neighbouring crops, bunds and tracks. That is precisely
-        # the mixed-pixel contamination the -10 m negative buffer exists to
-        # remove, reintroduced on the fields least able to tolerate it.
-        #
-        # But centre-only rasterisation makes tiny fields vanish entirely
-        # (two lands returned valid_px=0/0 on the 20 m SCL band).
-        #
-        # Resolution: use all_touched ONLY when centre-based sampling yields
-        # too few pixels to work with. Large fields keep strict containment;
-        # tiny fields get a sample at all, flagged via geometry/micro-land
-        # discounting rather than silently mixed in.
+        # SCL is read over a PADDED window so that a cloud / shadow lying just
+        # outside the boundary is still dilated into the field. The pad is
+        # the dilation distance plus one native cell. Pixel-native (m) CRS
+        # is guaranteed for Sentinel-2 (UTM).
+        pad_m = 0.0
+        if categorical and CLOUD_DILATION_PX > 0:
+            pad_m = CLOUD_DILATION_PX * 10.0 + max(abs(src.res[0]), 10.0)
+        clip_geom = geom_proj.buffer(pad_m) if pad_m else geom_proj
+
+        # all_touched is ADAPTIVE: strict centre-based sampling first; only if
+        # that yields too few cells (tiny fields) fall back to all_touched.
         def _clip(at: bool):
-            return rio_mask(
-                src, [mapping(geom_proj)],
-                crop=True, filled=True, all_touched=at,
-                nodata=src.nodata if src.nodata is not None else 0,
-            )
+            return rio_mask(src, [mapping(clip_geom)], crop=True,
+                            filled=False, all_touched=at, nodata=nodata)
 
         data, transform = _clip(False)
-        _arr = data[0] if data.ndim == 3 else data
-        if int(np.count_nonzero(np.isfinite(_arr) & (_arr != 0))) < ALL_TOUCHED_FALLBACK_PIXELS:
-            data, transform = _clip(True)
         data = data[0] if data.ndim == 3 else data
+        inside = ~np.ma.getmaskarray(data)
+        if int(np.count_nonzero(inside)) < ALL_TOUCHED_FALLBACK_PIXELS:
+            data, transform = _clip(True)
+            data = data[0] if data.ndim == 3 else data
+            inside = ~np.ma.getmaskarray(data)
+
+        # Genuine nodata INSIDE the polygon is not field either.
+        inside &= (np.ma.getdata(data) != nodata)
 
         if categorical:
-            arr = data.astype("int16")
+            arr = np.ma.filled(data, 0).astype("int16")
+            arr[~inside] = 0
+            if CLOUD_DILATION_PX > 0:
+                arr = dilate_scl(arr, native_res_m=abs(src.res[0]))
         else:
             arr = to_reflectance(data, item, band_key)
+            arr[~inside] = np.nan
 
         if reference is None:
-            # Return the CRS. Without it the caller cannot build a valid
-            # reference grid and reproject() raises "Missing dst_crs".
-            return arr, transform, src.crs
+            return arr, transform, src.crs, inside
 
-        ref_shape, ref_transform, ref_crs = reference
-
-        # Fail loudly rather than letting rasterio raise a bare
-        # "Missing dst_crs" that reads like a data problem. It is not - it
-        # means the caller built an incomplete reference grid.
+        ref_shape, ref_transform, ref_crs, ref_footprint = reference
         if ref_crs is None:
             raise ValueError(
                 f"reference grid for band {band_key} has no CRS; "
-                f"read_band must return (array, transform, crs)"
+                f"read_band must return (array, transform, crs, footprint)"
             )
 
-        dst = np.empty(ref_shape, dtype="float32" if not categorical else "int16")
-
-        reproject(
-            source=arr,
-            destination=dst,
-            src_transform=transform,
-            src_crs=src.crs,
-            dst_transform=ref_transform,
-            dst_crs=ref_crs,
-            # ---- P-04 FIX -------------------------------------------------
-            resampling=Resampling.nearest if categorical else Resampling.bilinear,
-        )
-        return dst, ref_transform, ref_crs
+        if categorical:
+            dst = np.zeros(ref_shape, dtype="int16")
+            reproject(source=arr, destination=dst,
+                      src_transform=transform, src_crs=src.crs,
+                      dst_transform=ref_transform, dst_crs=ref_crs,
+                      src_nodata=0, dst_nodata=0,
+                      resampling=Resampling.nearest)
+        else:
+            dst = np.full(ref_shape, np.nan, dtype="float32")
+            reproject(source=arr, destination=dst,
+                      src_transform=transform, src_crs=src.crs,
+                      dst_transform=ref_transform, dst_crs=ref_crs,
+                      src_nodata=np.nan, dst_nodata=np.nan,
+                      resampling=Resampling.bilinear)
+            dst[~ref_footprint] = np.nan
+        return dst, ref_transform, ref_crs, ref_footprint
 
 
 # ---------------------------------------------------------------------------
 # MASKING
 # ---------------------------------------------------------------------------
-def scl_masks(scl: np.ndarray) -> dict:
+def dilate_scl(scl: np.ndarray, native_res_m: float = 20.0) -> np.ndarray:
     """
-    Decompose SCL into named boolean masks.
+    Grow SCL cloud (8/9/10) and cloud-shadow (3) classes by CLOUD_DILATION_PX
+    ten-metre pixels on the band's NATIVE grid. Grown cells are re-labelled
+    9 (cloud) or 3 (shadow) only where they overwrite a non-cloud, non-nodata
+    class, so class accounting stays exact. Applied BEFORE reprojection so the
+    padded clip window lets outside clouds reach into the field.
+    """
+    if CLOUD_DILATION_PX <= 0:
+        return scl
+    iters = max(1, int(np.ceil(CLOUD_DILATION_PX * 10.0 / max(native_res_m, 1.0))))
+    out = scl.copy()
+    valid = scl != 0
+    cloud = np.isin(scl, SCL_CLOUD)
+    shadow = np.isin(scl, SCL_CLOUD_SHADOW)
+    if cloud.any():
+        grown = binary_dilation(cloud, iterations=iters) & valid & ~cloud
+        out[grown] = 9
+    if shadow.any():
+        grown = binary_dilation(shadow, iterations=iters) & valid & ~np.isin(out, SCL_CLOUD) & ~shadow
+        out[grown] = 3
+    return out
 
-    Returned fractions are computed over the pixels that are inside the
-    buffered polygon at all (SCL != 0), so 'cloud_fraction' means
-    'fraction of THIS FIELD under cloud' - a real quality metric, unlike
-    v1's coverage_percentage which measured polygon-area-in-bounding-box.
+
+def scl_masks(scl: np.ndarray, footprint: np.ndarray = None) -> dict:
+    """
+    Decompose SCL into named boolean masks over the FIELD FOOTPRINT.
+
+    footprint : reference-grid mask from read_band(). When given, every
+                fraction is computed over (footprint & SCL != 0) so that no
+                out-of-polygon cell can enter any statistic (F-1).
+
+    Cloud (8,9,10) and cloud shadow (3) arrive already dilated by
+    CLOUD_DILATION_PX (see dilate_scl); the ring is counted as that class.
     """
     in_field = scl != 0
+    if footprint is not None:
+        in_field &= footprint.astype(bool)
     n = int(np.count_nonzero(in_field))
 
-    crop      = np.isin(scl, SCL_CROP_SURFACE) & in_field
-    cloud     = np.isin(scl, SCL_CLOUD)         & in_field
-    shadow    = np.isin(scl, SCL_SHADOW)        & in_field
-    water     = np.isin(scl, SCL_WATER)         & in_field
-    saturated = np.isin(scl, SCL_SATURATED)     & in_field
-    snow      = np.isin(scl, SCL_SNOW)          & in_field
-    dark      = np.isin(scl, SCL_DARK)          & in_field
+    # Dilation already applied on the native grid by read_band()/dilate_scl().
+    cloud     = np.isin(scl, SCL_CLOUD)     & in_field
+    shadow    = np.isin(scl, SCL_SHADOW)    & in_field & ~cloud
+    dark      = np.isin(scl, SCL_DARK)      & in_field
+    water     = np.isin(scl, SCL_WATER)     & in_field & ~cloud & ~shadow
+    saturated = np.isin(scl, SCL_SATURATED) & in_field & ~cloud & ~shadow
+    snow      = np.isin(scl, SCL_SNOW)      & in_field & ~cloud & ~shadow
+    crop      = np.isin(scl, SCL_CROP_SURFACE) & in_field & ~cloud & ~shadow
 
     frac = lambda m: (float(np.count_nonzero(m)) / n) if n else 0.0
 
-    # Every in-field pixel must be attributable to a named ESA class.
-    # Anything unaccounted is SCL 7 (unclassified) or an unexpected code, and
-    # is surfaced rather than silently absorbed - a rejection with no stated
-    # reason is the failure mode this whole pipeline exists to remove.
     accounted = crop | cloud | shadow | water | saturated | snow | dark
     unaccounted = in_field & ~accounted
 
@@ -251,6 +304,7 @@ def scl_masks(scl: np.ndarray) -> dict:
         "dark_fraction": frac(dark),
         "unaccounted_fraction": frac(unaccounted),
         "crop_fraction": frac(crop),
+        "cloud_dilation_px": CLOUD_DILATION_PX,
     }
 
 
@@ -265,17 +319,7 @@ def apply_crop_mask(bands: dict, masks: dict) -> dict:
 
 # ---------------------------------------------------------------------------
 # GEOMETRY RESOLUTION WITH HONEST CONFIDENCE
-# Adopted from the retired kisanshakti-ndvi-engine repo
-# (land_geometry.resolve_land_geometry). Better than my original hard failure:
-# it always returns something, and LABELS how much to trust it.
-#
-# The label is not decoration - quality.assess() multiplies the score by
-# GEOMETRY_CONFIDENCE_FACTOR, so a centroid guess can never score like a
-# surveyed polygon. Degrading honestly beats refusing, but only if the
-# degradation is visible downstream.
 # ---------------------------------------------------------------------------
-from shapely.geometry import Point, mapping as _mapping
-
 CENTROID_BUFFER_DEG = 0.00036   # ~40 m at Indian latitudes
 
 
@@ -284,15 +328,14 @@ def resolve_geometry(land: dict):
     Returns (shapely_geometry, confidence) where confidence is
     'high' | 'medium' | 'low'.
 
-    high   - PostGIS boundary_geom / boundary_geojson (surveyed)
-    medium - legacy boundary_polygon_old jsonb (may be stale; the two are
-             not synchronised - see audit finding P-18)
+    high   - PostGIS boundary_geom (surveyed; PostgREST serialises as GeoJSON)
+    medium - legacy boundary_polygon_old jsonb (not synchronised with the above)
     low    - 40 m buffer around the centroid; no polygon exists at all
     """
     from shapely.geometry import shape as _shape
 
-    for key, conf in (("boundary_geojson", "high"),
-                      ("boundary_geom", "high"),
+    for key, conf in (("boundary_geom", "high"),
+                      ("boundary_geojson", "high"),
                       ("boundary", "high"),
                       ("boundary_polygon_old", "medium")):
         raw = land.get(key)

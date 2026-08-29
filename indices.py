@@ -70,8 +70,15 @@ INDEX_BANDS = {
 
 
 def _nd(a, b):
-    """Normalised difference with a zero-denominator guard."""
-    return (a - b) / (a + b + EPS)
+    """
+    Normalised difference. A pixel with no physical signal in EITHER band
+    (a + b <= EPS) is NaN, never 0.0: (0-0)/(0+0+eps) == 0.0 is how
+    out-of-polygon fill cells entered production NDVI as "bare soil" (F-1).
+    """
+    denom = a + b
+    with np.errstate(invalid="ignore", divide="ignore"):
+        out = (a - b) / np.where(denom > EPS, denom, np.nan)
+    return out
 
 
 def _available(bands: dict, name: str) -> bool:
@@ -120,13 +127,17 @@ def compute_indices(b: dict) -> dict:
         # L=0.5 soil-adjustment. Materially better than NDVI below ~40%
         # canopy cover - i.e. the emergence and establishment window where
         # absolute NDVI thresholds misclassify healthy crops.
-        out["SAVI"] = 1.5 * (b["B08"] - b["B04"]) / (b["B08"] + b["B04"] + 0.5 + EPS)
+        savi_den = b["B08"] + b["B04"] + 0.5
+        out["SAVI"] = np.where((b["B08"] + b["B04"]) > EPS,
+                               1.5 * (b["B08"] - b["B04"]) / savi_den, np.nan)
 
     if _available(b, "EVI"):
         # Resistant to soil and aerosol effects; does not saturate at high
         # LAI the way NDVI does at canopy closure, when yield is being set.
-        out["EVI"] = 2.5 * (b["B08"] - b["B04"]) / (
-            b["B08"] + 6.0 * b["B04"] - 7.5 * b["B02"] + 1.0 + EPS)
+        evi_den = b["B08"] + 6.0 * b["B04"] - 7.5 * b["B02"] + 1.0
+        with np.errstate(invalid="ignore", divide="ignore"):
+            out["EVI"] = np.where(np.abs(evi_den) > EPS,
+                                  2.5 * (b["B08"] - b["B04"]) / evi_den, np.nan)
 
     # -- Chlorophyll / nitrogen -------------------------------------------
     if _available(b, "NDRE"):

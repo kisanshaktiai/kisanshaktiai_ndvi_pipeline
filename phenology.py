@@ -1,181 +1,18 @@
 """
-phenology.py — stage-relative NDVI interpretation.
+phenology.py - temporal helpers over TRUE acquisition dates.
 
-COMPLETELY REWRITTEN. The previous version of this file was wrong twice over,
-and both errors explain the shape of this one.
-
-  MISTAKE 1  It carried a hardcoded CROP_NDVI_PHENOLOGY dict with an invented
-             stage vocabulary ('squaring_flowering', 'bulbing', crop 'TUR').
-             ZERO of those 54 stage codes matched crop_stage_master, which
-             holds 231 canonical stages the whole platform validates against.
-
-  MISTAKE 2  It assumed every crop counts days from SOWING. The platform
-             models das_reference as sowing | transplanting | planting |
-             nursery_sowing. Onion runs a 0-55 day nursery before its DAT
-             clock starts; chilli and tomato 0-30; transplanted rice 0-24;
-             potato counts from planting; maize from emergence. Feeding
-             days-since-sowing into an onion envelope indexed on DAT is off
-             by up to 55 days - three growth stages - and would report a
-             healthy crop as failing, with full confidence.
-
-THIS VERSION DELEGATES. It calls public.ndvi_stage_anomaly(), which wraps
-resolve_crop_phenology() (resolver_version 9). That engine already handles
-clock selection, variety das_min/max overrides, the biological transition
-ledger, evidence-driven transitions, phenology_index and confidence.
-
-Nothing here duplicates stage logic. If the platform's understanding of
-phenology changes, this file inherits it automatically.
+v2.2: compute_anomaly() / resolve_crop_code() removed. They called
+public.ndvi_stage_anomaly with land.cultivation_method and land.sowing_date,
+neither of which exists on public.lands, so the RPC was never reached and
+the result was never persisted (audit finding F-11). Stage-relative
+interpretation belongs to the decision layer, which owns the phenology
+resolver (fn_effective_method / resolve_crop_phenology_for_land).
 """
 
 from typing import Optional, List, Dict, Any
 from datetime import date
 
-from db import get_supabase_client
 from logger import logger
-
-
-# ---------------------------------------------------------------------------
-# CROP CODE RESOLUTION  (audit finding P-25)
-# ---------------------------------------------------------------------------
-# lands.current_crop holds LOCALISED DISPLAY NAMES, not codes. Live values:
-#   Groundnut | pulses | rice | Rice | sugarcane | Sugarcane | wheat
-#   | ऊस | गहू | तांदूळ | राजमा
-# crop_stage_master.crop_code is lowercase English.
-#   direct lower() match ............ 6 of 10 resolve
-#   via crops.value/label/label_mr ... 8 of 10 resolve
-#   never resolve ................... 'pulses' (a crop GROUP, not a crop),
-#                                     'तांदूळ' (Marathi for rice, unmapped)
-# Only 1 of 29 active lands has current_crop_id set, so free text is the de
-# facto source and this lookup is mandatory.
-# ---------------------------------------------------------------------------
-_crop_cache: Dict[str, Optional[str]] = {}
-
-
-def resolve_crop_code(raw: Optional[str]) -> Optional[str]:
-    """
-    Map a display name to a canonical crop_code via public.crops.
-    Returns None when it cannot resolve - NEVER guesses.
-    """
-    if not raw:
-        return None
-    key = str(raw).strip()
-    if key in _crop_cache:
-        return _crop_cache[key]
-
-    sb = get_supabase_client()
-    result = None
-    try:
-        rows = (sb.table("crops")
-                  .select("value,label,label_mr,label_hi")
-                  .limit(2000).execute().data) or []
-        low = key.lower()
-        for r in rows:
-            if (str(r.get("value") or "").lower() == low
-                    or str(r.get("label") or "").lower() == low
-                    or r.get("label_mr") == key
-                    or r.get("label_hi") == key):
-                result = (r.get("value") or "").lower() or None
-                break
-    except Exception:
-        logger.exception(f"crop code lookup failed for {key!r}")
-
-    if result is None:
-        logger.warning(f"Crop {key!r} does not resolve to a canonical crop_code")
-    _crop_cache[key] = result
-    return result
-
-
-# ---------------------------------------------------------------------------
-# CROP CYCLE  (audit finding P-24 - OPEN PLATFORM BUG, workaround below)
-# ---------------------------------------------------------------------------
-# resolve_crop_phenology does NOT treat crop_cycle='universal' as a wildcard,
-# but fn_resolve_stage does. Verified live:
-#   crop_schedules.crop_cycle    -> only value present is 'plant'
-#   crop_stage_master.crop_cycle -> 'universal' for every crop but sugarcane
-#
-#   resolve_crop_phenology('rice','plant',...)      -> NO ROWS
-#   resolve_crop_phenology('rice',NULL,...)         -> RICE_TILLERING
-#   resolve_crop_phenology('sugarcane','plant',...) -> SUGARCANE_GRAND_GROWTH
-#   resolve_crop_phenology('sugarcane','universal') -> NO ROWS
-#
-# No single argument works for all crops. Passing the land's real value
-# silently returns nothing for everything except sugarcane.
-#
-# WORKAROUND: pass the real cycle only for sugarcane (where plant vs ratoon
-# genuinely differ AND the real value works); NULL everywhere else.
-# REMOVE THIS once migration 003 section 5 BUG A is applied.
-# ---------------------------------------------------------------------------
-CYCLE_AWARE_CROPS = {"sugarcane"}
-
-
-def effective_crop_cycle(crop_code: Optional[str],
-                         raw_cycle: Optional[str]) -> Optional[str]:
-    if crop_code and crop_code.lower() in CYCLE_AWARE_CROPS:
-        return raw_cycle
-    return None
-
-
-# ---------------------------------------------------------------------------
-# ANOMALY - delegated
-# ---------------------------------------------------------------------------
-def compute_anomaly(ndvi: float,
-                    crop_raw: Optional[str],
-                    cultivation_method: Optional[str],
-                    sow_date: Optional[date],
-                    transplant_date: Optional[date] = None,
-                    crop_cycle: Optional[str] = None,
-                    variety_id: Optional[str] = None,
-                    current_gdd: Optional[float] = None,
-                    land_id: Optional[str] = None,
-                    as_of: Optional[date] = None) -> Dict[str, Any]:
-    """
-    Stage-relative NDVI anomaly via public.ndvi_stage_anomaly().
-
-    Returns the RPC row, or a refusal dict. NEVER falls back to an absolute
-    threshold - that is the C-11 defect which classified healthy rice at
-    12 DAT as CRITICAL.
-
-    The returned ndvi_confidence is bounded by stage_confidence: an anomaly
-    cannot be more certain than the stage it is measured against. Every land
-    currently resolves at das_provisional = 0.50.
-    """
-    unknown = {"status": "unknown", "z_score": None, "stage_code": None,
-               "ndvi_confidence": 0.0, "reason": None}
-
-    crop_code = resolve_crop_code(crop_raw)
-    if crop_code is None:
-        return {**unknown, "reason": f"crop_unresolved:{crop_raw}"}
-    if not cultivation_method:
-        return {**unknown, "reason": "cultivation_method_required"}
-    if not sow_date:
-        return {**unknown, "reason": "sow_date_required"}
-
-    def _iso(d):
-        return d.isoformat() if hasattr(d, "isoformat") else d
-
-    try:
-        rows = get_supabase_client().rpc("ndvi_stage_anomaly", {
-            "p_ndvi": float(ndvi),
-            "p_crop_code": crop_code,
-            "p_cultivation_method": cultivation_method,
-            "p_sow_date": _iso(sow_date),
-            "p_transplant_date": _iso(transplant_date),
-            "p_crop_cycle": effective_crop_cycle(crop_code, crop_cycle),
-            "p_variety_id": variety_id,
-            "p_current_gdd": current_gdd,
-            "p_as_of": _iso(as_of or date.today()),
-            "p_land_id": land_id,
-        }).execute().data or []
-    except Exception:
-        logger.exception(f"ndvi_stage_anomaly RPC failed for land {land_id}")
-        return {**unknown, "reason": "rpc_error"}
-
-    if not rows:
-        return {**unknown, "reason": "stage_unresolved"}
-
-    r = rows[0]
-    r.setdefault("ndvi_confidence", 0.0)
-    return r
 
 
 # ---------------------------------------------------------------------------

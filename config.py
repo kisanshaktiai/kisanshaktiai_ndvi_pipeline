@@ -72,6 +72,16 @@ SCL_INVALID      = [0, 7]           # no-data, unclassified
 SCL_SATURATED    = [1]              # saturated / defective sensor pixel
 SCL_SNOW         = [11]             # snow / ice
 SCL_DARK         = [2]              # dark area / topographic shadow
+SCL_CLOUD_SHADOW = [3]              # cloud shadow only (dilated with cloud)
+
+# Cloud-edge dilation on the 10 m grid. Sen2Cor SCL under-detects cloud and
+# shadow boundaries (CMIX 2022); production time series dilate by 1-6 px.
+# 2 px = 20 m ring. Set 0 to disable.
+CLOUD_DILATION_PX = 2
+
+# Surface reflectance above this is physically implausible for land and is
+# treated as nodata (bright cloud / saturation that SCL missed).
+REFLECTANCE_MAX = 1.2
 
 # ---------------------------------------------------------------------------
 # GEOMETRY / MIXED-PIXEL CONTROL  (P-12)
@@ -177,3 +187,24 @@ GEOMETRY_CONFIDENCE_FACTOR = {"high": 1.0, "medium": 0.85, "low": 0.55}
 # PER FIELD ONLY - never a tile aggregate (see migration 006 Part A).
 # ---------------------------------------------------------------------------
 NDVI_HISTOGRAM_BINS = 20
+# ---------------------------------------------------------------------------
+# v2.2 INTEGRITY GUARDS  (forensic audit 2026-08-29)
+# ---------------------------------------------------------------------------
+# A field of A m2 cannot contain more than A/100 ten-metre pixels plus an
+# edge allowance. Observations exceeding this are refused: it is the exact
+# signature of finding F-1 (out-of-polygon cells counted as field).
+PIXEL_AREA_M2 = 100.0
+PIXEL_COUNT_TOLERANCE = 1.25        # +25 % for all_touched edge cells
+
+# One physical acquisition can be delivered in two overlapping MGRS tiles
+# (T43QCU / T43QDU, same datetime + orbit). Store it ONCE (F-5).
+DEDUPE_TILE_OVERLAP = True
+
+# Temporal plausibility: NDVI over a crop canopy cannot physically change by
+# more than this within this many days (harvest / flooding excepted, which
+# is exactly why this is a FLAG, not a rejection). Flagged rows carry
+# metadata.temporal_outlier=true so the decision layer can treat them with
+# reduced trust or ask the farmer.
+TEMPORAL_MAX_DELTA = 0.35
+TEMPORAL_WINDOW_DAYS = 7
+TEMPORAL_LOOKBACK_DAYS = 45

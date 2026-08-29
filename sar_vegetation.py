@@ -17,10 +17,11 @@ which used uncalibrated GRD DN, had no cited derivation for the weights,
 returned dimensionless dB compared against thresholds as if it were
 volumetric moisture, and produced NULL in 100% of rows.
 
-v2 computes RVI (Radar Vegetation Index), a published dual-pol index that
-tracks canopy biomass and is bounded [0, 1]:
-
-    RVI = 4 * VH / (VV + VH)          (linear power, not dB)
+v2 computes RVI (Radar Vegetation Index), the dual-pol form
+(RVI = 4*sigma0_VH / (sigma0_VV + sigma0_VH), Mandal et al. 2020, RSE 247)
+in linear power. Its mathematical range is [0, 2] (maximum when VH == VV);
+v2.1 clipped it to [0, 1], which truncated every pixel with VH/VV > 1/3 -
+i.e. exactly the dense-canopy pixels the index exists to detect (F-9).
 
 RVI is NOT NDVI and is never written to ndvi_value. It is stored in its own
 column with observation_source='sentinel-1' so the decision brain can weight
@@ -40,12 +41,12 @@ def rvi_from_gamma0(vv: np.ndarray, vh: np.ndarray) -> dict:
     vh = np.where(np.isfinite(vh) & (vh > 0), vh, np.nan)
 
     rvi = 4.0 * vh / (vv + vh + EPS)
-    rvi = np.clip(rvi, 0.0, 1.0)
+    rvi = np.clip(rvi, 0.0, 2.0)
 
     # Cross-pol ratio: complementary structure/moisture signal
     cr = vh / (vv + EPS)
 
-    valid = np.isfinite(rvi)
+    valid = np.isfinite(rvi) & np.isfinite(cr)
     n = int(np.count_nonzero(valid))
     if n < S1_MIN_VALID_PIXELS:
         return {"rvi_mean": None, "rvi_std": None, "cross_ratio_db": None,
@@ -53,28 +54,12 @@ def rvi_from_gamma0(vv: np.ndarray, vh: np.ndarray) -> dict:
                 "reject_reason": f"valid_pixels {n} < {S1_MIN_VALID_PIXELS}"}
 
     return {
-        "rvi_mean": round(float(np.nanmean(rvi)), 4),
-        "rvi_std": round(float(np.nanstd(rvi)), 4),
-        "cross_ratio_db": round(float(10.0 * np.log10(np.nanmean(cr) + EPS)), 3),
+        "rvi_mean": round(float(np.nanmean(rvi[valid])), 4),
+        "rvi_std": round(float(np.nanstd(rvi[valid])), 4),
+        "cross_ratio_db": round(float(10.0 * np.log10(np.nanmean(cr[valid]) + EPS)), 3),
+        "vv_db_mean": round(float(10.0 * np.log10(np.nanmean(vv[valid]) + EPS)), 3),
+        "vh_db_mean": round(float(10.0 * np.log10(np.nanmean(vh[valid]) + EPS)), 3),
         "valid_pixels": n,
         "accepted": True,
         "reject_reason": None,
     }
-
-
-# Approximate RVI -> NDVI-equivalent envelope.
-# DELIBERATELY COARSE. RVI responds to canopy structure and dielectric
-# properties, not chlorophyll; the relationship is crop- and
-# incidence-angle-dependent. This mapping exists only to let the symbolic
-# layer register "vegetation present / sparse / dense" during cloud outages.
-# It must never drive a nutrient or disease diagnosis.
-def rvi_vigor_class(rvi: float) -> str:
-    if rvi is None:
-        return "unknown"
-    if rvi < 0.25:
-        return "bare_or_very_sparse"
-    if rvi < 0.45:
-        return "sparse_canopy"
-    if rvi < 0.65:
-        return "developing_canopy"
-    return "dense_canopy"

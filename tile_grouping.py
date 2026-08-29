@@ -47,7 +47,7 @@ from collections import defaultdict
 from typing import Dict, List, Iterable
 from shapely.geometry import shape
 
-from sentinel_search import search_s2, acquisition_meta
+from sentinel_search import search_s2
 from logger import logger
 
 
@@ -105,7 +105,8 @@ def scenes_for_group(lands: List[dict], lookback_days: int = None) -> List:
 
     geoms = []
     for land in lands:
-        raw = land.get("boundary_geojson") or land.get("boundary_polygon_old")
+        raw = (land.get("boundary_geom") or land.get("boundary_geojson")
+               or land.get("boundary_polygon_old"))
         if not raw:
             continue
         try:
@@ -118,7 +119,8 @@ def scenes_for_group(lands: List[dict], lookback_days: int = None) -> List:
             logger.debug(f"Land {land.get('id')} geometry unusable for grouping: {e}")
 
     if not geoms:
-        return []
+        # None (not []) so process_land falls back to a per-land search.
+        return None
 
     union = unary_union(geoms)
     # convex_hull keeps the STAC intersects payload small for scattered fields

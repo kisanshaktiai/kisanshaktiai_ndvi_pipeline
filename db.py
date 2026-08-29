@@ -156,31 +156,60 @@ def count_eligible_lands(tenant_id: Optional[str] = None) -> int:
 # ---------------------------------------------------------------------------
 # NDVI WRITE - idempotent on TRUE acquisition identity
 # ---------------------------------------------------------------------------
-def upsert_observations(rows: List[Dict]) -> int:
+def upsert_observations(rows: List[Dict], run_started_at: datetime = None):
     """
-    Conflict target is (land_id, scene_id), not (land_id, date).
+    Conflict target is (land_id, scene_id). Returns (upserted, newly_inserted).
 
-    v1 used (land_id, date) where date was the pipeline RUN date, so every
-    daily run minted a new key for the same underlying scene - producing
-    96.4% consecutive-day spacing and 72.2% exact repeated values from a
-    satellite that revisits every ~3 days.
-
-    Keying on scene_id makes re-runs and backfills genuinely idempotent:
-    the same acquisition can never be stored twice under different dates.
+    v2.1 returned len(rows) and main.py reported it as "observations
+    written": on 2026-08-29 the run reported 30 written while 0 rows were
+    created (F-6). newly_inserted is measured from created_at >= run start,
+    so the run summary and the exit-code guard see REAL new data.
     """
     if not rows:
-        return 0
+        return 0, 0
+    land_id = rows[0].get("land_id")
     try:
         with_retry(
             lambda: supabase.table("ndvi_data")
                     .upsert(rows, on_conflict="land_id,scene_id").execute(),
-            what=f"upsert {len(rows)} observation(s) for land {rows[0].get('land_id')}",
+            what=f"upsert {len(rows)} observation(s) for land {land_id}",
         )
-        return len(rows)
     except Exception:
-        logger.exception(f"upsert failed for {len(rows)} rows "
-                         f"(land {rows[0].get('land_id')})")
+        logger.exception(f"upsert failed for {len(rows)} rows (land {land_id})")
         raise
+
+    new = 0
+    if run_started_at is not None:
+        try:
+            scene_ids = [r["scene_id"] for r in rows if r.get("scene_id")]
+            res = (supabase.table("ndvi_data").select("id", count="exact")
+                   .eq("land_id", land_id).in_("scene_id", scene_ids)
+                   .gte("created_at", run_started_at.isoformat())
+                   .limit(1).execute())
+            new = int(res.count or 0)
+        except Exception as e:
+            logger.warning(f"new-row count failed for {land_id}: {e}")
+            new = -1   # unknown; caller treats as "could not verify"
+    return len(rows), new
+
+
+def optical_history(land_id: str, days: int) -> List[Dict]:
+    """Stored optical observations in the last `days` (for temporal checks)."""
+    from datetime import date, timedelta
+    since = (date.today() - timedelta(days=days)).isoformat()
+    try:
+        return (supabase.table("ndvi_data")
+                .select("acquisition_date, ndvi_value, scene_id")
+                .eq("land_id", land_id)
+                .eq("observation_source", "sentinel-2")
+                .eq("observation_type", "observed")
+                .not_.is_("ndvi_value", "null")
+                .gte("acquisition_date", since)
+                .order("acquisition_date", desc=True)
+                .limit(30).execute().data) or []
+    except Exception:
+        logger.exception(f"optical_history failed for {land_id}")
+        return []
 
 
 def latest_observation(land_id: str) -> Optional[Dict]:
@@ -210,6 +239,12 @@ def update_land_snapshot(*, land_id: str, ndvi_value, acquisition_date,
     that disagreed with ndvi_data, with value divergence up to 0.360.
     v2 writes the TRUE acquisition date and the quality that produced it.
     """
+    if ndvi_value is None:
+        # F-3: the radar path used to write last_ndvi_value = NULL over a
+        # valid optical cache. The cache is OPTICAL ONLY; radar-only runs
+        # must go through mark_land_status() instead.
+        raise ValueError("update_land_snapshot requires an optical ndvi_value; "
+                         "use mark_land_status for radar-only runs")
     data = {
         "last_ndvi_value": ndvi_value,
         "last_ndvi_calculation": acquisition_date,   # TRUE acquisition date
@@ -291,6 +326,7 @@ def write_run_summary(summary: Dict) -> None:
     scheduler goes red on a silent failure.
     """
     try:
-        supabase.table("ndvi_run_summary").insert(summary).execute()
+        with_retry(lambda: supabase.table("ndvi_run_summary").insert(summary).execute(),
+                   what="run summary insert", attempts=2)
     except Exception as e:
         logger.warning(f"run summary insert failed (table may not exist yet): {e}")

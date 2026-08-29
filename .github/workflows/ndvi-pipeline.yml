@@ -1,17 +1,33 @@
 name: NDVI Pipeline
 
 on:
-  workflow_dispatch:        # manual run
+  workflow_dispatch:
+    inputs:
+      backfill:
+        description: "Use BACKFILL_DAYS window (re-process history; idempotent)"
+        type: boolean
+        default: false
+      tenant:
+        description: "Restrict to one tenant_id (optional)"
+        type: string
+        default: ""
   schedule:
     - cron: "0 2 * * *"     # daily at 02:00 UTC
+
+# Never run two pipelines at once: the lands snapshot is last-writer-wins.
+concurrency:
+  group: ndvi-pipeline
+  cancel-in-progress: false
 
 jobs:
   run-ndvi:
     runs-on: ubuntu-latest
+    timeout-minutes: 90
 
     env:
       SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
       SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+      PYTHONUNBUFFERED: "1"
 
     steps:
       - name: Checkout repository
@@ -21,6 +37,7 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: pip
 
       - name: Install dependencies
         run: |
@@ -28,4 +45,17 @@ jobs:
           pip install -r requirements.txt
 
       - name: Run NDVI pipeline
-        run: python main.py
+        run: |
+          ARGS=""
+          if [ "${{ github.event.inputs.backfill }}" = "true" ]; then ARGS="$ARGS --backfill"; fi
+          if [ -n "${{ github.event.inputs.tenant }}" ]; then ARGS="$ARGS --tenant ${{ github.event.inputs.tenant }}"; fi
+          python main.py $ARGS 2>&1 | tee pipeline.log
+          exit ${PIPESTATUS[0]}
+
+      - name: Upload run log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ndvi-pipeline-log-${{ github.run_id }}
+          path: pipeline.log
+          retention-days: 30
