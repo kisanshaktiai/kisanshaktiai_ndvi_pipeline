@@ -1,0 +1,3 @@
+# Test-only dependencies. NOT installed by the pipeline workflow.
+-r requirements.txt
+pytest>=8.0

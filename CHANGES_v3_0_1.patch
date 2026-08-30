@@ -1,0 +1,175 @@
+diff --git a/main.py b/main.py
+index 172729b..96f47f1 100644
+--- a/main.py
++++ b/main.py
+@@ -1,11 +1,15 @@
+ """
+-main.py - NDVI pipeline v2.2 entrypoint (GitHub Actions: `python main.py`).
++main.py - NDVI pipeline entrypoint (GitHub Actions: `python main.py`).
+ 
+ Exit codes:
+   0  run completed; at least one acquisition accepted
+   1  fatal error
+   2  ran cleanly but accepted ZERO acquisitions (optical or radar) - FAILURE
+ 
++The version reported in logs and in ndvi_run_summary.notes is taken from
++processor.PIPELINE_VERSION - the same constant stamped into every row's
++metadata - so a run can never again report v2.2 while writing v3.0 rows.
++
+ v2.2 CHANGES (forensic audit 2026-08-29)
+ ----------------------------------------
+ F-3  A radar-only land NEVER overwrites lands.last_ndvi_value. The optical
+@@ -31,7 +35,7 @@ from db import (
+     iter_lands, count_eligible_lands, upsert_observations, optical_history,
+     update_land_snapshot, mark_land_status, log_step, write_run_summary,
+ )
+-from processor import process_land
++from processor import process_land, PIPELINE_VERSION
+ from tile_grouping import group_lands_by_tile, scenes_for_group, log_group_plan
+ from phenology import classify_trend
+ from config import TILE_WORKERS, LOOKBACK_DAYS, BACKFILL_DAYS, TEMPORAL_LOOKBACK_DAYS
+@@ -140,7 +144,7 @@ def main() -> int:
+     run_started = datetime.now(timezone.utc)
+ 
+     total = count_eligible_lands(args.tenant)
+-    logger.info(f"NDVI v2.2 start | eligible_lands={total} | lookback={lookback}d "
++    logger.info(f"NDVI {PIPELINE_VERSION} start | eligible_lands={total} | lookback={lookback}d "
+                 f"| tenant={args.tenant or 'ALL'}")
+ 
+     if args.dry_run:
+@@ -205,12 +209,12 @@ def main() -> int:
+         "tenant_id": args.tenant,
+         "notes": {"observations_new": stats["new_observations"],
+                   "lands_new_count_unverified": stats["unverified_new"],
+-                  "pipeline_version": "v2.2"},
++                  "pipeline_version": PIPELINE_VERSION},
+     }
+     write_run_summary(summary)
+ 
+     logger.info("=" * 72)
+-    logger.info(f"NDVI v2.2 finished in {duration:.0f}s")
++    logger.info(f"NDVI {PIPELINE_VERSION} finished in {duration:.0f}s")
+     logger.info(f"  lands: {stats['lands']} processed ({stats['completed']} ok / "
+                 f"{stats['skipped']} skipped / {stats['failed']} failed)  skip_rate={skip_rate}%")
+     logger.info(f"  observations: {stats['observations']} upserted, "
+diff --git a/processor.py b/processor.py
+index dfa097d..f87e329 100644
+--- a/processor.py
++++ b/processor.py
+@@ -58,7 +58,7 @@ from config import (
+ )
+ from logger import logger
+ 
+-PIPELINE_VERSION = "v3.0"
++PIPELINE_VERSION = "v3.0.1"
+ 
+ # 10 m reference bands + the 20 m bands we resample onto them.
+ S2_BANDS_10M = ["B02", "B03", "B04", "B08"]
+@@ -505,7 +505,11 @@ def _process_s1(land: dict, geom_measured, buffer_applied: bool,
+ 
+         res = rvi_from_gamma0(vv, vh, weights=coverage)
+         epc_valid = float(res.get("epc") or 0.0)
+-        s1_status, s1_ev = evidence_tier(epc_valid)
++        # Same purity definition as the optical path: EPC over the cells
++        # that contributed, so radar is held to one standard, not two.
++        s1_cells = int(res.get("valid_pixels") or 0)
++        s1_purity = (epc_valid / s1_cells) if s1_cells else None
++        s1_status, s1_ev = evidence_tier(epc_valid, s1_purity)
+         if epc_valid < MIN_EPC:
+             logger.info(f"REJECT radar | land={land['id']} | EPC {epc_valid:.2f} < {MIN_EPC}")
+             return []
+@@ -551,6 +555,7 @@ def _process_s1(land: dict, geom_measured, buffer_applied: bool,
+             "valid_pixels": res["valid_pixels"],
+             "total_pixels": n_fp,
+             "effective_pixel_count": round(epc_valid, 4),
++            "coverage_weighted_purity": round(s1_purity, 4) if s1_purity else None,
+             "evidence_confidence": s1_ev,
+             "measurement_status": s1_status,
+             "spatial_stat_method": SPATIAL_STAT_METHOD,
+@@ -572,6 +577,7 @@ def _process_s1(land: dict, geom_measured, buffer_applied: bool,
+                     "effective_pixel_count": round(epc_valid, 4),
+                     "effective_pixel_count_total": round(epc_total, 4),
+                     "raw_valid_cell_count": n_fp,
++                    "coverage_weighted_purity": round(s1_purity, 4) if s1_purity else None,
+                     "measurement_status": s1_status,
+                     "evidence_confidence": s1_ev,
+                     "coverage_area_error": round(area_err, 4),
+diff --git a/quality.py b/quality.py
+index a693b76..6d6666b 100644
+--- a/quality.py
++++ b/quality.py
+@@ -45,25 +45,57 @@ from config import (
+ )
+ 
+ 
+-def evidence_tier(epc: float) -> tuple:
++_TIERS = [("OBSERVED_STRONG", "high"),
++          ("OBSERVED_LIMITED", "medium"),
++          ("OBSERVED_WEAK", "low"),
++          ("INSUFFICIENT_SPATIAL_SUPPORT", "insufficient")]
++
++
++def evidence_tier(epc: float, purity: float = None) -> tuple:
+     """
+-    (measurement_status, evidence_confidence) from spatial support alone.
++    (measurement_status, evidence_confidence) from spatial support.
+ 
+     EPC >= EPC_STRONG is the only published anchor (Sitokonstantinou et al.
+     2020: >= 8 full pixels for Sentinel-2 field monitoring). The lower
+     boundaries are engineering operating rules, NOT validated constants -
+     see config.py. They must be re-derived from the smallholder calibration
+     dataset before anyone quotes them as accuracy.
++
++    PURITY DEMOTION (v3.0.1). EPC alone says how much area was measured; it
++    does not say how much of that area came from cells shared with bunds,
++    roads or a neighbour's crop. Live example from run 33286187042: land
++    3307fac1 scored EPC 8.34 -> "high" while purity was 0.48 and 88 % of
++    the measured area sat in partially covered cells. Since the decision
++    layer gates prescriptive advice on evidence_confidence, "8 effective
++    pixels assembled from half-cells" must not be presented as equal to
++    "8 whole interior pixels". Below LOW_PURITY_THRESHOLD the tier drops
++    exactly one band - never more, because the measurement is real, just
++    less isolable from its surroundings.
++
++    The demotion never reaches "insufficient": that band is reserved for
++    EPC < MIN_EPC, which is a hard REJECT. Letting purity push a row into
++    it would cap quality_score at 0.30, trip MIN_QUALITY_SCORE and silently
++    turn a low-confidence observation into no observation at all. Whether a
++    row is stored stays governed by EPC alone; purity governs only how far
++    a decision may lean on it.
++
++    purity=None (e.g. a sensor path that cannot compute it) leaves the
++    EPC-only result untouched rather than guessing.
+     """
+     if epc is None:
+         return "UNKNOWN_SPATIAL_SUPPORT", "low"
+     if epc >= EPC_STRONG:
+-        return "OBSERVED_STRONG", "high"
+-    if epc >= EPC_LIMITED:
+-        return "OBSERVED_LIMITED", "medium"
+-    if epc >= EPC_WEAK:
+-        return "OBSERVED_WEAK", "low"
+-    return "INSUFFICIENT_SPATIAL_SUPPORT", "insufficient"
++        i = 0
++    elif epc >= EPC_LIMITED:
++        i = 1
++    elif epc >= EPC_WEAK:
++        i = 2
++    else:
++        i = 3
++
++    if purity is not None and purity < LOW_PURITY_THRESHOLD:
++        i = min(i + 1, 2)          # 2 = "low"; never demote into a reject
++    return _TIERS[i]
+ 
+ 
+ @dataclass
+@@ -179,7 +211,7 @@ def assess(masks: dict,
+     score *= GEOMETRY_CONFIDENCE_FACTOR.get(geometry_confidence, 0.5)
+ 
+     # ---- SPATIAL SUPPORT TIER ------------------------------------------
+-    status, ev_conf = evidence_tier(epc_valid if epc_valid else None)
++    status, ev_conf = evidence_tier(epc_valid if epc_valid else None, purity)
+     # Weak support caps decision confidence outright; it is not averaged
+     # away against a clean sky.
+     if ev_conf == "medium":
