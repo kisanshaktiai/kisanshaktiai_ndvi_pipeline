@@ -45,25 +45,57 @@ from config import (
 )
 
 
-def evidence_tier(epc: float) -> tuple:
+_TIERS = [("OBSERVED_STRONG", "high"),
+          ("OBSERVED_LIMITED", "medium"),
+          ("OBSERVED_WEAK", "low"),
+          ("INSUFFICIENT_SPATIAL_SUPPORT", "insufficient")]
+
+
+def evidence_tier(epc: float, purity: float = None) -> tuple:
     """
-    (measurement_status, evidence_confidence) from spatial support alone.
+    (measurement_status, evidence_confidence) from spatial support.
 
     EPC >= EPC_STRONG is the only published anchor (Sitokonstantinou et al.
     2020: >= 8 full pixels for Sentinel-2 field monitoring). The lower
     boundaries are engineering operating rules, NOT validated constants -
     see config.py. They must be re-derived from the smallholder calibration
     dataset before anyone quotes them as accuracy.
+
+    PURITY DEMOTION (v3.0.1). EPC alone says how much area was measured; it
+    does not say how much of that area came from cells shared with bunds,
+    roads or a neighbour's crop. Live example from run 33286187042: land
+    3307fac1 scored EPC 8.34 -> "high" while purity was 0.48 and 88 % of
+    the measured area sat in partially covered cells. Since the decision
+    layer gates prescriptive advice on evidence_confidence, "8 effective
+    pixels assembled from half-cells" must not be presented as equal to
+    "8 whole interior pixels". Below LOW_PURITY_THRESHOLD the tier drops
+    exactly one band - never more, because the measurement is real, just
+    less isolable from its surroundings.
+
+    The demotion never reaches "insufficient": that band is reserved for
+    EPC < MIN_EPC, which is a hard REJECT. Letting purity push a row into
+    it would cap quality_score at 0.30, trip MIN_QUALITY_SCORE and silently
+    turn a low-confidence observation into no observation at all. Whether a
+    row is stored stays governed by EPC alone; purity governs only how far
+    a decision may lean on it.
+
+    purity=None (e.g. a sensor path that cannot compute it) leaves the
+    EPC-only result untouched rather than guessing.
     """
     if epc is None:
         return "UNKNOWN_SPATIAL_SUPPORT", "low"
     if epc >= EPC_STRONG:
-        return "OBSERVED_STRONG", "high"
-    if epc >= EPC_LIMITED:
-        return "OBSERVED_LIMITED", "medium"
-    if epc >= EPC_WEAK:
-        return "OBSERVED_WEAK", "low"
-    return "INSUFFICIENT_SPATIAL_SUPPORT", "insufficient"
+        i = 0
+    elif epc >= EPC_LIMITED:
+        i = 1
+    elif epc >= EPC_WEAK:
+        i = 2
+    else:
+        i = 3
+
+    if purity is not None and purity < LOW_PURITY_THRESHOLD:
+        i = min(i + 1, 2)          # 2 = "low"; never demote into a reject
+    return _TIERS[i]
 
 
 @dataclass
@@ -179,7 +211,7 @@ def assess(masks: dict,
     score *= GEOMETRY_CONFIDENCE_FACTOR.get(geometry_confidence, 0.5)
 
     # ---- SPATIAL SUPPORT TIER ------------------------------------------
-    status, ev_conf = evidence_tier(epc_valid if epc_valid else None)
+    status, ev_conf = evidence_tier(epc_valid if epc_valid else None, purity)
     # Weak support caps decision confidence outright; it is not averaged
     # away against a clean sky.
     if ev_conf == "medium":

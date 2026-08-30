@@ -1,10 +1,14 @@
 """
-main.py - NDVI pipeline v2.2 entrypoint (GitHub Actions: `python main.py`).
+main.py - NDVI pipeline entrypoint (GitHub Actions: `python main.py`).
 
 Exit codes:
   0  run completed; at least one acquisition accepted
   1  fatal error
   2  ran cleanly but accepted ZERO acquisitions (optical or radar) - FAILURE
+
+The version reported in logs and in ndvi_run_summary.notes is taken from
+processor.PIPELINE_VERSION - the same constant stamped into every row's
+metadata - so a run can never again report v2.2 while writing v3.0 rows.
 
 v2.2 CHANGES (forensic audit 2026-08-29)
 ----------------------------------------
@@ -31,7 +35,7 @@ from db import (
     iter_lands, count_eligible_lands, upsert_observations, optical_history,
     update_land_snapshot, mark_land_status, log_step, write_run_summary,
 )
-from processor import process_land
+from processor import process_land, PIPELINE_VERSION
 from tile_grouping import group_lands_by_tile, scenes_for_group, log_group_plan
 from phenology import classify_trend
 from config import TILE_WORKERS, LOOKBACK_DAYS, BACKFILL_DAYS, TEMPORAL_LOOKBACK_DAYS
@@ -140,7 +144,7 @@ def main() -> int:
     run_started = datetime.now(timezone.utc)
 
     total = count_eligible_lands(args.tenant)
-    logger.info(f"NDVI v2.2 start | eligible_lands={total} | lookback={lookback}d "
+    logger.info(f"NDVI {PIPELINE_VERSION} start | eligible_lands={total} | lookback={lookback}d "
                 f"| tenant={args.tenant or 'ALL'}")
 
     if args.dry_run:
@@ -205,12 +209,12 @@ def main() -> int:
         "tenant_id": args.tenant,
         "notes": {"observations_new": stats["new_observations"],
                   "lands_new_count_unverified": stats["unverified_new"],
-                  "pipeline_version": "v2.2"},
+                  "pipeline_version": PIPELINE_VERSION},
     }
     write_run_summary(summary)
 
     logger.info("=" * 72)
-    logger.info(f"NDVI v2.2 finished in {duration:.0f}s")
+    logger.info(f"NDVI {PIPELINE_VERSION} finished in {duration:.0f}s")
     logger.info(f"  lands: {stats['lands']} processed ({stats['completed']} ok / "
                 f"{stats['skipped']} skipped / {stats['failed']} failed)  skip_rate={skip_rate}%")
     logger.info(f"  observations: {stats['observations']} upserted, "

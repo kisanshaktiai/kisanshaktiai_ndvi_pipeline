@@ -58,7 +58,7 @@ from config import (
 )
 from logger import logger
 
-PIPELINE_VERSION = "v3.0"
+PIPELINE_VERSION = "v3.0.1"
 
 # 10 m reference bands + the 20 m bands we resample onto them.
 S2_BANDS_10M = ["B02", "B03", "B04", "B08"]
@@ -505,7 +505,11 @@ def _process_s1(land: dict, geom_measured, buffer_applied: bool,
 
         res = rvi_from_gamma0(vv, vh, weights=coverage)
         epc_valid = float(res.get("epc") or 0.0)
-        s1_status, s1_ev = evidence_tier(epc_valid)
+        # Same purity definition as the optical path: EPC over the cells
+        # that contributed, so radar is held to one standard, not two.
+        s1_cells = int(res.get("valid_pixels") or 0)
+        s1_purity = (epc_valid / s1_cells) if s1_cells else None
+        s1_status, s1_ev = evidence_tier(epc_valid, s1_purity)
         if epc_valid < MIN_EPC:
             logger.info(f"REJECT radar | land={land['id']} | EPC {epc_valid:.2f} < {MIN_EPC}")
             return []
@@ -551,6 +555,7 @@ def _process_s1(land: dict, geom_measured, buffer_applied: bool,
             "valid_pixels": res["valid_pixels"],
             "total_pixels": n_fp,
             "effective_pixel_count": round(epc_valid, 4),
+            "coverage_weighted_purity": round(s1_purity, 4) if s1_purity else None,
             "evidence_confidence": s1_ev,
             "measurement_status": s1_status,
             "spatial_stat_method": SPATIAL_STAT_METHOD,
@@ -572,6 +577,7 @@ def _process_s1(land: dict, geom_measured, buffer_applied: bool,
                     "effective_pixel_count": round(epc_valid, 4),
                     "effective_pixel_count_total": round(epc_total, 4),
                     "raw_valid_cell_count": n_fp,
+                    "coverage_weighted_purity": round(s1_purity, 4) if s1_purity else None,
                     "measurement_status": s1_status,
                     "evidence_confidence": s1_ev,
                     "coverage_area_error": round(area_err, 4),
