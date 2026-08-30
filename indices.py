@@ -241,3 +241,107 @@ def index_statistics(arr: np.ndarray) -> dict:
         "cv":     float(std / (abs(mean) + 1e-6)),
         "count":  int(finite.size),
     }
+
+
+# ===========================================================================
+# v3 COVERAGE-WEIGHTED FIELD STATISTICS
+# ===========================================================================
+def weighted_index_statistics(arr: np.ndarray, weights: np.ndarray) -> dict:
+    """
+    Field statistics where every cell counts for the fraction of it that is
+    actually inside the farmer's polygon.
+
+    arr     : index values on the reference grid (NaN where invalid).
+    weights : per-cell coverage fraction in [0,1] (0 = outside / masked).
+
+    Returns None when there is no contributing area.
+
+    Keys
+      mean/median/p10/p90/min/max/std/cv : coverage-weighted (percentiles are
+          weighted quantiles - the value at which cumulative COVERAGE, not
+          cumulative cell count, reaches the quantile).
+      epc          : effective pixel count = sum of contributing coverage.
+                     This is the real spatial support: EPC*100 m2 is the area
+                     the statistic was actually measured over.
+      n_cells      : raw contributing cell count (kept - it answers a
+                     different question from EPC and both are stored).
+      purity       : epc / n_cells. 1.0 = every contributing cell lies wholly
+                     inside the field; 0.4 = the measurement rests mostly on
+                     boundary cells shared with bunds, roads or neighbours.
+      interior_share : share of EPC coming from cells >= INTERIOR_COVERAGE.
+      boundary_share : 1 - interior_share.
+      n_eff        : Kish effective sample size (sum w)^2 / sum w^2, used for
+                     the standard error - NOT the same as EPC.
+      se           : standard error of the weighted mean = std / sqrt(n_eff).
+                     SPATIAL SAMPLING ONLY. It does not include sensor,
+                     atmospheric-correction, geolocation or boundary-
+                     delineation error, so it is a floor on the true
+                     uncertainty, never the whole of it.
+    """
+    from config import INTERIOR_COVERAGE
+
+    v = np.asarray(arr, dtype="float64")
+    w = np.asarray(weights, dtype="float64")
+    ok = np.isfinite(v) & (w > 0)
+    if not ok.any():
+        return None
+
+    v = v[ok]
+    w = w[ok]
+    sw = float(w.sum())
+    if sw <= 0:
+        return None
+
+    mean = float((v * w).sum() / sw)
+    var = float((w * (v - mean) ** 2).sum() / sw)
+    std = float(np.sqrt(max(var, 0.0)))
+
+    order = np.argsort(v)
+    vs, ws = v[order], w[order]
+    cum = np.cumsum(ws) - 0.5 * ws
+    cum /= sw
+
+    def wq(q):
+        return float(np.interp(q, cum, vs))
+
+    n_cells = int(v.size)
+    n_eff = float(sw ** 2 / (w ** 2).sum())
+    interior = float(w[w >= INTERIOR_COVERAGE].sum())
+
+    return {
+        "mean": round(mean, 6),
+        "median": round(wq(0.5), 6),
+        "p10": round(wq(0.10), 6),
+        "p90": round(wq(0.90), 6),
+        "min": round(float(vs[0]), 6),
+        "max": round(float(vs[-1]), 6),
+        "std": round(std, 6),
+        "cv": round(std / abs(mean), 6) if abs(mean) > 1e-6 else None,
+        "epc": round(sw, 4),
+        "n_cells": n_cells,
+        "purity": round(sw / n_cells, 4),
+        "interior_share": round(interior / sw, 4),
+        "boundary_share": round(1.0 - interior / sw, 4),
+        "n_eff": round(n_eff, 4),
+        "se": round(std / np.sqrt(n_eff), 6) if n_eff > 0 else None,
+    }
+
+
+def weighted_histogram(arr: np.ndarray, weights: np.ndarray, bins: int,
+                       lo: float = -1.0, hi: float = 1.0) -> dict:
+    """
+    Coverage-weighted histogram: each bin accumulates AREA (in effective
+    pixels), not cell counts, so partially covered boundary cells cannot
+    over-represent themselves in a patchiness assessment.
+    """
+    v = np.asarray(arr, dtype="float64")
+    w = np.asarray(weights, dtype="float64")
+    ok = np.isfinite(v) & (w > 0)
+    if not ok.any():
+        return None
+    counts, edges = np.histogram(v[ok], bins=bins, range=(lo, hi), weights=w[ok])
+    return {
+        "bins": [round(float(e), 3) for e in edges],
+        "counts": [round(float(c), 4) for c in counts],
+        "weighting": "coverage_area_effective_pixels",
+    }

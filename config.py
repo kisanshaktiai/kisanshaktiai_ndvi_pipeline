@@ -194,7 +194,64 @@ NDVI_HISTOGRAM_BINS = 20
 # edge allowance. Observations exceeding this are refused: it is the exact
 # signature of finding F-1 (out-of-polygon cells counted as field).
 PIXEL_AREA_M2 = 100.0
-PIXEL_COUNT_TOLERANCE = 1.25        # +25 % for all_touched edge cells
+PIXEL_COUNT_TOLERANCE = 1.25        # legacy pixel-count bound (diagnostic only)
+
+# ===========================================================================
+# v3 SMALLHOLDER EVIDENCE MODEL  (fractional coverage + EPC + uncertainty)
+# ===========================================================================
+# Every raster cell now carries the EXACT fraction of its 100 m2 that lies
+# inside the farmer's polygon. Statistics are weighted by that fraction, so
+# a cell 12 % inside the field contributes 12 % of a pixel - not a whole one.
+#
+# Effective Pixel Count (EPC) = sum of those fractions over CONTRIBUTING
+# cells. It is the real spatial support behind a number, and it is
+# area-true by construction:
+#       EPC_total * 100 m2  ==  measurement polygon area
+# which turns the old F-1 plausibility heuristic into a checkable identity.
+SPATIAL_STAT_METHOD = "fractional_coverage_v3"
+
+# Exact per-cell coverage is computed with shapely intersections. Above this
+# many candidate cells (~2.5 km x 2.5 km of 10 m grid) we fall back to
+# binary coverage and say so in the row's provenance rather than stalling.
+MAX_COVERAGE_CELLS = 250_000
+
+# Cells whose coverage is below this contribute nothing (numerical slivers).
+MIN_CELL_COVERAGE = 0.005
+
+# --- EPC operating bands ---------------------------------------------------
+# EPC >= 8 is the only band with published support: Sitokonstantinou et al.
+# 2020 (Remote Sensing 12(14):2195) require ">= 8 full pixels inside a
+# border" for Sentinel-2 field monitoring, and report that sub-0.5 ha
+# parcels frequently fail to give reliable evidence. The 5 / 3 boundaries
+# below are ENGINEERING OPERATING RULES chosen to degrade gracefully; they
+# are NOT validated constants and must be revisited against the smallholder
+# calibration dataset once it exists.
+EPC_STRONG = 8.0        # published anchor
+EPC_LIMITED = 5.0       # engineering rule - NOT VALIDATED
+EPC_WEAK = 3.0          # engineering rule - NOT VALIDATED
+MIN_EPC = 3.0           # below this: no defensible field statistic
+
+# Share of a contributing cell that must sit inside the field before the
+# cell is considered "interior" rather than boundary-influenced.
+INTERIOR_COVERAGE = 0.99
+
+# EPC at which the support term of quality_score saturates. Matches the
+# legacy QUALITY_SATURATION_PIXELS so large-field scores stay comparable.
+EPC_SATURATION = 50.0
+
+# --- Adaptive boundary treatment -------------------------------------------
+# A fixed -10 m erosion removes ~86 % of a square 10-guntha (1012 m2) field.
+# With coverage weighting the erosion is no longer needed to suppress mixed
+# pixels - the weights do that - so it is applied only to fields large
+# enough that it costs little and still buys a cleaner interior.
+ADAPTIVE_EROSION_MIN_AREA_M2 = 5000.0   # 0.5 ha
+
+# Confidence multiplier applied when boundary-influenced cells dominate the
+# measurement (purity below this). Replaces the blunt micro-land penalty as
+# the primary small-field discount; the area penalty is retained only for
+# fields whose polygon itself is doubtful.
+LOW_PURITY_THRESHOLD = 0.60
+LOW_PURITY_FACTOR = 0.75
 
 # One physical acquisition can be delivered in two overlapping MGRS tiles
 # (T43QCU / T43QDU, same datetime + orbit). Store it ONCE (F-5).

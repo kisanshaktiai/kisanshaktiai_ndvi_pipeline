@@ -1,6 +1,24 @@
 """
 raster_utils.py - band I/O, reflectance scaling, geometry, masking.
 
+v3 CHANGE (smallholder evidence audit): EXACT FRACTIONAL COVERAGE
+--------------------------------------------------------------------
+read_band() now returns, alongside the array, the exact fraction of each
+10 m cell that lies inside the measurement polygon. Whole-pixel counting
+is gone from the measurement path: a cell 12 % inside the field is worth
+0.12 of a pixel, not 1. This removes the boundary over-count that made
+all_touched sample up to ~181 % of a sub-0.5-acre field, and it makes the
+support metric (EPC) area-true by construction.
+
+all_touched is NOT removed - it is demoted. It now decides only WHICH
+cells are candidates (every cell the polygon touches); the coverage
+fraction decides what each one is worth. Selecting with centre-sampling
+instead would silently discard real crop area on narrow strips.
+
+Fixed -10 m erosion is likewise demoted to large fields only
+(ADAPTIVE_EROSION_MIN_AREA_M2): on a square 10-guntha field it removes
+~86 % of the area, and with coverage weighting it no longer buys anything.
+
 v2.2 CHANGES (forensic audit 2026-08-29, finding F-1 / F-8 / F-10)
 --------------------------------------------------------------------
 F-1  The field FOOTPRINT was defined as `SCL != 0`. SCL is a 20 m band; its
@@ -37,6 +55,7 @@ metadata with baseline fallback (P-17).
 """
 
 import numpy as np
+import shapely
 import rasterio
 from rasterio.mask import mask as rio_mask
 from rasterio.warp import reproject, Resampling
@@ -48,8 +67,9 @@ from pyproj import Transformer, CRS
 from config import (
     SCL_CROP_SURFACE, SCL_CLOUD, SCL_SHADOW, SCL_WATER,
     SCL_SATURATED, SCL_SNOW, SCL_DARK, SCL_CLOUD_SHADOW,
-    FIELD_BUFFER_M, MIN_BUFFERED_AREA_M2, ALL_TOUCHED_FALLBACK_PIXELS,
+    FIELD_BUFFER_M, MIN_BUFFERED_AREA_M2,
     CLOUD_DILATION_PX, REFLECTANCE_MAX,
+    MAX_COVERAGE_CELLS, MIN_CELL_COVERAGE, ADAPTIVE_EROSION_MIN_AREA_M2,
 )
 from logger import logger
 
@@ -71,13 +91,24 @@ def utm_crs_for(geom):
     return CRS.from_epsg(epsg)
 
 
-def buffered_field(geom):
+def measurement_field(geom):
     """
-    Erode the field by one Sentinel-2 pixel to suppress mixed edge pixels.
+    Decide the polygon that will actually be measured.
 
-    Returns (geometry_wgs84, buffer_applied: bool, area_m2: float).
-    area_m2 is ALWAYS the raw surveyed area (used for the pixel-count
-    plausibility check); the eroded geometry is what gets sampled.
+    Returns (geometry_wgs84, buffer_applied, raw_area_m2, measured_area_m2).
+
+    ADAPTIVE (v3). A fixed -10 m erosion is only sane for large fields: on a
+    square 10-guntha parcel (1012 m2, ~31.8 m a side) it leaves ~139 m2, i.e.
+    it throws away ~86 % of the farm. Since v3 weights every cell by its
+    exact coverage, mixed edge pixels are already handled by the weights and
+    erosion buys nothing on small fields. So:
+
+        area >= ADAPTIVE_EROSION_MIN_AREA_M2 -> erode FIELD_BUFFER_M
+        area <  ADAPTIVE_EROSION_MIN_AREA_M2 -> measure the farmer's polygon
+
+    The measured polygon is recorded per row (metadata.evidence) because the
+    two regimes are different physical definitions of "the field" and must
+    not be compared blindly across a trend.
     """
     utm = utm_crs_for(geom)
     fwd = Transformer.from_crs("EPSG:4326", utm, always_xy=True).transform
@@ -86,14 +117,90 @@ def buffered_field(geom):
     g_utm = shp_transform(fwd, geom)
     raw_area = g_utm.area
 
+    if raw_area < ADAPTIVE_EROSION_MIN_AREA_M2:
+        return geom, False, raw_area, raw_area
+
     eroded = g_utm.buffer(FIELD_BUFFER_M)
     if eroded.is_empty or eroded.area < MIN_BUFFERED_AREA_M2:
-        logger.debug(
-            f"Field too small to buffer (raw {raw_area:.0f} m2); using raw polygon"
-        )
-        return geom, False, raw_area
+        return geom, False, raw_area, raw_area
 
-    return shp_transform(inv, eroded), True, raw_area
+    return shp_transform(inv, eroded), True, raw_area, eroded.area
+
+
+# Backwards-compatible alias (old name, 3-tuple) for any external caller.
+def buffered_field(geom):
+    g, applied, raw, _ = measurement_field(geom)
+    return g, applied, raw
+
+
+# ---------------------------------------------------------------------------
+# EXACT FRACTIONAL COVERAGE
+# ---------------------------------------------------------------------------
+def coverage_fractions(geom_proj, transform, shape):
+    """
+    Exact fraction of each raster cell covered by `geom_proj`.
+
+    geom_proj : polygon ALREADY in the raster CRS (metres).
+    Returns (coverage float32 [0,1] of `shape`, method: str).
+
+    Computed analytically with shapely intersections - no sampling, no
+    approximation - so the identity
+
+        coverage.sum() * cell_area == polygon area inside the window
+
+    holds to floating-point precision and is asserted by the caller. Falls
+    back to binary coverage only for rotated grids or windows larger than
+    MAX_COVERAGE_CELLS, and reports which happened.
+    """
+    h, w = shape
+    a, b, _c, d, e, _f = transform.a, transform.b, transform.c, transform.d, transform.e, transform.f
+    if b != 0 or d != 0:
+        return None, "binary_rotated_grid"
+    if h * w > MAX_COVERAGE_CELLS:
+        return None, "binary_window_too_large"
+
+    cols = np.arange(w)
+    rows = np.arange(h)
+    x0 = transform.c + cols * a
+    x1 = x0 + a
+    y0 = transform.f + rows * e
+    y1 = y0 + e
+
+    X0, Y0 = np.meshgrid(x0, y0)
+    X1, Y1 = np.meshgrid(x1, y1)
+    xmin = np.minimum(X0, X1).ravel()
+    xmax = np.maximum(X0, X1).ravel()
+    ymin = np.minimum(Y0, Y1).ravel()
+    ymax = np.maximum(Y0, Y1).ravel()
+
+    cov = np.zeros(h * w, dtype="float64")
+    gminx, gminy, gmaxx, gmaxy = geom_proj.bounds
+    cand = np.where((xmax > gminx) & (xmin < gmaxx) &
+                    (ymax > gminy) & (ymin < gmaxy))[0]
+    if cand.size:
+        cells = shapely.box(xmin[cand], ymin[cand], xmax[cand], ymax[cand])
+        inter = shapely.intersection(cells, geom_proj)
+        cov[cand] = shapely.area(inter) / abs(a * e)
+
+    cov = np.clip(cov, 0.0, 1.0).reshape(h, w).astype("float32")
+    cov[cov < MIN_CELL_COVERAGE] = 0.0
+    return cov, "exact_shapely"
+
+
+def bbox_cells(geom, cell_m: float = 10.0) -> int:
+    """
+    Hard upper bound on the number of `cell_m` grid cells any clip of
+    `geom` can contain, in either sampling mode: every cell (centre-sampled
+    OR all_touched) lies inside the UTM bounding box grown by one cell on
+    each axis. Used by the pixel-plausibility gate for narrow strips, where
+    all_touched legitimately touches ~2x the area-based count.
+    """
+    utm = utm_crs_for(geom)
+    fwd = Transformer.from_crs("EPSG:4326", utm, always_xy=True).transform
+    minx, miny, maxx, maxy = shp_transform(fwd, geom).bounds
+    nx = int(np.ceil((maxx - minx) / cell_m)) + 1
+    ny = int(np.ceil((maxy - miny) / cell_m)) + 1
+    return max(nx * ny, 1)
 
 
 # ---------------------------------------------------------------------------
@@ -150,11 +257,12 @@ def read_band(item, band_key: str, geometry, reference=None, categorical=False):
     """
     Read one band clipped to `geometry`.
 
-    Returns (array, transform, crs, footprint).
-      footprint : bool ndarray, True where the cell is INSIDE the clip
-                  geometry on THIS band's grid (rasterio's own mask). For the
-                  reference band this is the authoritative field footprint.
-                  For reprojected bands it is the reference footprint.
+    Returns (array, transform, crs, coverage).
+      coverage : float32 [0,1] on THIS band's grid - the exact fraction of
+                 each cell inside the measurement polygon. For the reference
+                 band it is computed analytically; reprojected bands inherit
+                 the reference coverage. coverage > 0 replaces the old
+                 boolean footprint everywhere.
 
     categorical=True  -> nearest-neighbour resampling, int16, fill 0 (SCL).
     categorical=False -> bilinear, float32, fill NaN, DN -> reflectance.
@@ -174,22 +282,29 @@ def read_band(item, band_key: str, geometry, reference=None, categorical=False):
             pad_m = CLOUD_DILATION_PX * 10.0 + max(abs(src.res[0]), 10.0)
         clip_geom = geom_proj.buffer(pad_m) if pad_m else geom_proj
 
-        # all_touched is ADAPTIVE: strict centre-based sampling first; only if
-        # that yields too few cells (tiny fields) fall back to all_touched.
-        def _clip(at: bool):
-            return rio_mask(src, [mapping(clip_geom)], crop=True,
-                            filled=False, all_touched=at, nodata=nodata)
-
-        data, transform = _clip(False)
+        # v3: all_touched=True is now the SELECTION rule - every cell the
+        # polygon touches is a candidate. The exact coverage fraction, not
+        # the on/off mask, decides what each candidate is worth. Centre-only
+        # selection would drop real crop area on strips narrower than ~2 px.
+        data, transform = rio_mask(src, [mapping(clip_geom)], crop=True,
+                                   filled=False, all_touched=True,
+                                   nodata=nodata)
         data = data[0] if data.ndim == 3 else data
-        inside = ~np.ma.getmaskarray(data)
-        if int(np.count_nonzero(inside)) < ALL_TOUCHED_FALLBACK_PIXELS:
-            data, transform = _clip(True)
-            data = data[0] if data.ndim == 3 else data
-            inside = ~np.ma.getmaskarray(data)
 
-        # Genuine nodata INSIDE the polygon is not field either.
+        if reference is None:
+            cov, cov_method = coverage_fractions(geom_proj, transform, data.shape)
+            if cov is None:
+                cov = (~np.ma.getmaskarray(data)).astype("float32")
+                logger.warning(f"coverage fallback ({cov_method}) for {band_key}")
+        else:
+            cov = None          # inherited from the reference grid below
+            cov_method = "inherited"
+
+        inside = (cov > 0) if cov is not None else ~np.ma.getmaskarray(data)
+        # Genuine nodata INSIDE the polygon contributes nothing.
         inside &= (np.ma.getdata(data) != nodata)
+        if cov is not None:
+            cov = np.where(inside, cov, 0.0).astype("float32")
 
         if categorical:
             arr = np.ma.filled(data, 0).astype("int16")
@@ -201,9 +316,10 @@ def read_band(item, band_key: str, geometry, reference=None, categorical=False):
             arr[~inside] = np.nan
 
         if reference is None:
-            return arr, transform, src.crs, inside
+            return arr, transform, src.crs, cov
 
-        ref_shape, ref_transform, ref_crs, ref_footprint = reference
+        ref_shape, ref_transform, ref_crs, ref_coverage = reference
+        ref_footprint = ref_coverage > 0
         if ref_crs is None:
             raise ValueError(
                 f"reference grid for band {band_key} has no CRS; "
@@ -225,7 +341,7 @@ def read_band(item, band_key: str, geometry, reference=None, categorical=False):
                       src_nodata=np.nan, dst_nodata=np.nan,
                       resampling=Resampling.bilinear)
             dst[~ref_footprint] = np.nan
-        return dst, ref_transform, ref_crs, ref_footprint
+        return dst, ref_transform, ref_crs, ref_coverage
 
 
 # ---------------------------------------------------------------------------
@@ -255,21 +371,27 @@ def dilate_scl(scl: np.ndarray, native_res_m: float = 20.0) -> np.ndarray:
     return out
 
 
-def scl_masks(scl: np.ndarray, footprint: np.ndarray = None) -> dict:
+def scl_masks(scl: np.ndarray, coverage: np.ndarray = None) -> dict:
     """
-    Decompose SCL into named boolean masks over the FIELD FOOTPRINT.
+    Decompose SCL into named masks over the field, with AREA-WEIGHTED
+    fractions.
 
-    footprint : reference-grid mask from read_band(). When given, every
-                fraction is computed over (footprint & SCL != 0) so that no
-                out-of-polygon cell can enter any statistic (F-1).
+    coverage : per-cell coverage fraction from read_band(). Every reported
+               fraction is a share of FIELD AREA (sum of coverage), not a
+               share of touched cells - so a cloud clipping one corner of a
+               boundary cell no longer counts as a whole cloudy pixel.
 
     Cloud (8,9,10) and cloud shadow (3) arrive already dilated by
     CLOUD_DILATION_PX (see dilate_scl); the ring is counted as that class.
     """
     in_field = scl != 0
-    if footprint is not None:
-        in_field &= footprint.astype(bool)
+    if coverage is not None:
+        w = np.where(in_field, coverage, 0.0).astype("float64")
+    else:
+        w = in_field.astype("float64")
+    in_field = w > 0
     n = int(np.count_nonzero(in_field))
+    epc_total = float(w.sum())
 
     # Dilation already applied on the native grid by read_band()/dilate_scl().
     cloud     = np.isin(scl, SCL_CLOUD)     & in_field
@@ -280,13 +402,17 @@ def scl_masks(scl: np.ndarray, footprint: np.ndarray = None) -> dict:
     snow      = np.isin(scl, SCL_SNOW)      & in_field & ~cloud & ~shadow
     crop      = np.isin(scl, SCL_CROP_SURFACE) & in_field & ~cloud & ~shadow
 
-    frac = lambda m: (float(np.count_nonzero(m)) / n) if n else 0.0
+    # AREA-weighted fraction (share of EPC), not cell-count fraction.
+    frac = lambda m: (float(w[m].sum()) / epc_total) if epc_total > 0 else 0.0
 
     accounted = crop | cloud | shadow | water | saturated | snow | dark
     unaccounted = in_field & ~accounted
 
     return {
         "in_field": in_field,
+        "coverage": w,
+        "epc_total": epc_total,
+        "epc_crop": float(w[crop].sum()),
         "crop": crop,
         "cloud": cloud,
         "shadow": shadow,

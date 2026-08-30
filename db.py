@@ -156,6 +156,60 @@ def count_eligible_lands(tenant_id: Optional[str] = None) -> int:
 # ---------------------------------------------------------------------------
 # NDVI WRITE - idempotent on TRUE acquisition identity
 # ---------------------------------------------------------------------------
+_KNOWN_COLUMNS = None          # cache; None = not probed yet
+_DROPPED_REPORTED = set()
+
+
+def known_columns() -> Optional[set]:
+    """
+    Columns that actually exist on public.ndvi_data, probed once from a real
+    row. Returns None if the probe fails or the table is empty (then nothing
+    is filtered).
+
+    WHY THIS EXISTS. v3 writes evidence fields (effective_pixel_count,
+    coverage_weighted_purity, ...) that do not exist until the accompanying
+    migration is applied. PostgREST rejects the WHOLE batch on an unknown
+    column, so without this probe deploying the code before the migration
+    would fail every land, every night. Everything filtered out here is
+    still persisted inside metadata.evidence, so no evidence is lost - only
+    its promotion to a first-class column waits for the migration.
+    """
+    global _KNOWN_COLUMNS
+    if _KNOWN_COLUMNS is not None:
+        return _KNOWN_COLUMNS or None
+    try:
+        res = supabase.table("ndvi_data").select("*").limit(1).execute()
+        if res.data:
+            _KNOWN_COLUMNS = set(res.data[0].keys())
+            logger.info(f"ndvi_data schema probe: {len(_KNOWN_COLUMNS)} columns")
+        else:
+            _KNOWN_COLUMNS = set()
+    except Exception as e:
+        logger.warning(f"schema probe failed ({e}); writing rows unfiltered")
+        _KNOWN_COLUMNS = set()
+    return _KNOWN_COLUMNS or None
+
+
+def _filter_to_schema(rows: List[Dict]) -> List[Dict]:
+    cols = known_columns()
+    if not cols:
+        return rows
+    out = []
+    for r in rows:
+        extra = set(r) - cols
+        if extra:
+            for k in sorted(extra):
+                if k not in _DROPPED_REPORTED:
+                    _DROPPED_REPORTED.add(k)
+                    logger.warning(
+                        f"column '{k}' absent from ndvi_data - kept in "
+                        f"metadata.evidence only. Apply the v3 migration to "
+                        f"promote it to a column.")
+            r = {k: v for k, v in r.items() if k in cols}
+        out.append(r)
+    return out
+
+
 def upsert_observations(rows: List[Dict], run_started_at: datetime = None):
     """
     Conflict target is (land_id, scene_id). Returns (upserted, newly_inserted).
@@ -168,6 +222,7 @@ def upsert_observations(rows: List[Dict], run_started_at: datetime = None):
     if not rows:
         return 0, 0
     land_id = rows[0].get("land_id")
+    rows = _filter_to_schema(rows)
     try:
         with_retry(
             lambda: supabase.table("ndvi_data")
@@ -182,10 +237,12 @@ def upsert_observations(rows: List[Dict], run_started_at: datetime = None):
     if run_started_at is not None:
         try:
             scene_ids = [r["scene_id"] for r in rows if r.get("scene_id")]
-            res = (supabase.table("ndvi_data").select("id", count="exact")
+            res = with_retry(
+                lambda: supabase.table("ndvi_data").select("id", count="exact")
                    .eq("land_id", land_id).in_("scene_id", scene_ids)
                    .gte("created_at", run_started_at.isoformat())
-                   .limit(1).execute())
+                   .limit(1).execute(),
+                what=f"new-row count {land_id}", attempts=3)
             new = int(res.count or 0)
         except Exception as e:
             logger.warning(f"new-row count failed for {land_id}: {e}")
@@ -198,7 +255,8 @@ def optical_history(land_id: str, days: int) -> List[Dict]:
     from datetime import date, timedelta
     since = (date.today() - timedelta(days=days)).isoformat()
     try:
-        return (supabase.table("ndvi_data")
+        res = with_retry(
+            lambda: supabase.table("ndvi_data")
                 .select("acquisition_date, ndvi_value, scene_id")
                 .eq("land_id", land_id)
                 .eq("observation_source", "sentinel-2")
@@ -206,9 +264,11 @@ def optical_history(land_id: str, days: int) -> List[Dict]:
                 .not_.is_("ndvi_value", "null")
                 .gte("acquisition_date", since)
                 .order("acquisition_date", desc=True)
-                .limit(30).execute().data) or []
-    except Exception:
-        logger.exception(f"optical_history failed for {land_id}")
+                .limit(30).execute(),
+            what=f"optical_history {land_id}", attempts=3)
+        return res.data or []
+    except Exception as e:
+        logger.warning(f"optical_history failed for {land_id}: {type(e).__name__}: {e}")
         return []
 
 

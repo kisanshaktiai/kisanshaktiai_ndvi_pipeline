@@ -32,10 +32,16 @@ import numpy as np
 from config import EPS, S1_MIN_VALID_PIXELS
 
 
-def rvi_from_gamma0(vv: np.ndarray, vh: np.ndarray) -> dict:
+def rvi_from_gamma0(vv: np.ndarray, vh: np.ndarray,
+                    weights: np.ndarray = None) -> dict:
     """
     vv, vh: linear-power gamma0 arrays (sentinel-1-rtc assets are already
     calibrated gamma0; do NOT pass dB).
+    weights: per-cell coverage fraction (v3). When given, every mean is
+    coverage-weighted and `epc` is the radar effective pixel count - the
+    same spatial-support primitive the optical path uses. One
+    implementation, two sensors: a boundary cell must not count as a whole
+    radar pixel any more than as a whole optical one.
     """
     vv = np.where(np.isfinite(vv) & (vv > 0), vv, np.nan)
     vh = np.where(np.isfinite(vh) & (vh > 0), vh, np.nan)
@@ -47,19 +53,34 @@ def rvi_from_gamma0(vv: np.ndarray, vh: np.ndarray) -> dict:
     cr = vh / (vv + EPS)
 
     valid = np.isfinite(rvi) & np.isfinite(cr)
+    if weights is not None:
+        w = np.where(valid, np.asarray(weights, dtype="float64"), 0.0)
+        valid = valid & (w > 0)
+    else:
+        w = valid.astype("float64")
+
     n = int(np.count_nonzero(valid))
+    epc = float(w.sum())
     if n < S1_MIN_VALID_PIXELS:
         return {"rvi_mean": None, "rvi_std": None, "cross_ratio_db": None,
-                "valid_pixels": n, "accepted": False,
+                "valid_pixels": n, "epc": round(epc, 4), "rvi_array": rvi,
+                "accepted": False,
                 "reject_reason": f"valid_pixels {n} < {S1_MIN_VALID_PIXELS}"}
 
+    sw = w.sum()
+    wmean = lambda a: float((np.where(valid, a, 0.0) * w).sum() / sw)
+    m_rvi = wmean(rvi)
+    wstd = float(np.sqrt(max((w * (np.where(valid, rvi, m_rvi) - m_rvi) ** 2).sum() / sw, 0.0)))
+
     return {
-        "rvi_mean": round(float(np.nanmean(rvi[valid])), 4),
-        "rvi_std": round(float(np.nanstd(rvi[valid])), 4),
-        "cross_ratio_db": round(float(10.0 * np.log10(np.nanmean(cr[valid]) + EPS)), 3),
-        "vv_db_mean": round(float(10.0 * np.log10(np.nanmean(vv[valid]) + EPS)), 3),
-        "vh_db_mean": round(float(10.0 * np.log10(np.nanmean(vh[valid]) + EPS)), 3),
+        "rvi_mean": round(m_rvi, 4),
+        "rvi_std": round(wstd, 4),
+        "cross_ratio_db": round(float(10.0 * np.log10(wmean(cr) + EPS)), 3),
+        "vv_db_mean": round(float(10.0 * np.log10(wmean(vv) + EPS)), 3),
+        "vh_db_mean": round(float(10.0 * np.log10(wmean(vh) + EPS)), 3),
         "valid_pixels": n,
+        "epc": round(epc, 4),
+        "rvi_array": rvi,
         "accepted": True,
         "reject_reason": None,
     }
