@@ -1,57 +1,11 @@
 """
 raster_utils.py - band I/O, reflectance scaling, geometry, masking.
 
-v3 CHANGE (smallholder evidence audit): EXACT FRACTIONAL COVERAGE
---------------------------------------------------------------------
-read_band() now returns, alongside the array, the exact fraction of each
-10 m cell that lies inside the measurement polygon. Whole-pixel counting
-is gone from the measurement path: a cell 12 % inside the field is worth
-0.12 of a pixel, not 1. This removes the boundary over-count that made
-all_touched sample up to ~181 % of a sub-0.5-acre field, and it makes the
-support metric (EPC) area-true by construction.
-
-all_touched is NOT removed - it is demoted. It now decides only WHICH
-cells are candidates (every cell the polygon touches); the coverage
-fraction decides what each one is worth. Selecting with centre-sampling
-instead would silently discard real crop area on narrow strips.
-
-Fixed -10 m erosion is likewise demoted to large fields only
-(ADAPTIVE_EROSION_MIN_AREA_M2): on a square 10-guntha field it removes
-~86 % of the area, and with coverage weighting it no longer buys anything.
-
-v2.2 CHANGES (forensic audit 2026-08-29, finding F-1 / F-8 / F-10)
---------------------------------------------------------------------
-F-1  The field FOOTPRINT was defined as `SCL != 0`. SCL is a 20 m band; its
-     clip overhangs the 10 m reference grid, so reference cells OUTSIDE the
-     polygon received a real SCL class while B04/B08 held the nodata fill (0),
-     which to_reflectance turned into 0.0 and NDVI turned into exactly 0.0.
-     Live evidence: 16/16 optical rows had more pixels than the field area
-     allows and 13/16 had ndvi_spatial_min == 0.0. Means were biased low by
-     25-60 %.
-     FIX: read_band now returns the rasterio *mask* of the reference band
-     (True = inside polygon at 10 m). scl_masks() intersects SCL with it.
-     Nothing outside the surveyed boundary can be counted any more.
-
-F-8  Fill outside the polygon is now NaN (masked read), so bilinear
-     resampling of the 20 m bands (B05, B11) cannot blend zeros into edge
-     pixels. reproject() propagates NaN; the shared finite mask in indices.py
-     drops those cells.
-
-F-10 Negative surface reflectance (deep shadow / water after offset) is now
-     NaN, not 0.0. A pixel with no physical reflectance must not produce a
-     "valid" index value.
-
-CLOUD-EDGE DILATION (research-backed, new)
-     Sen2Cor's SCL under-detects cloud and shadow edges; production
-     time-series work routinely dilates the cloud/shadow mask by 1-6 pixels
-     (CMIX 2022; MDPI RS 14:4221 uses 120 m). We dilate cloud (8,9,10) and
-     cloud shadow (3) by CLOUD_DILATION_PX on the 10 m grid. Dilated pixels
-     are treated as cloud, so a field touched by a cloud edge is scored and
-     gated honestly rather than measured through haze.
-
-Earlier v1 fixes retained: SCL nearest resampling (P-04), SCL_CROP_SURFACE
-[4,5] from config (P-05), -10 m erosion (P-12), scale/offset from STAC
-metadata with baseline fallback (P-17).
+The measurement path uses exact fractional pixel coverage on the 10 m
+reference grid. Spectral values are converted to surface reflectance using
+STAC raster:bands semantics: physical_value = raw * scale + offset. When
+raster metadata are absent, Sentinel-2 processing-baseline >= 04.00 falls
+back to the ESA BOA_ADD_OFFSET representation: (DN - 1000) / 10000.
 """
 
 import numpy as np
@@ -93,27 +47,15 @@ def utm_crs_for(geom):
 
 def measurement_field(geom):
     """
-    Decide the polygon that will actually be measured.
+    Return (geometry_wgs84, erosion_applied, raw_area_m2, measured_area_m2).
 
-    Returns (geometry_wgs84, buffer_applied, raw_area_m2, measured_area_m2).
-
-    ADAPTIVE (v3). A fixed -10 m erosion is only sane for large fields: on a
-    square 10-guntha parcel (1012 m2, ~31.8 m a side) it leaves ~139 m2, i.e.
-    it throws away ~86 % of the farm. Since v3 weights every cell by its
-    exact coverage, mixed edge pixels are already handled by the weights and
-    erosion buys nothing on small fields. So:
-
-        area >= ADAPTIVE_EROSION_MIN_AREA_M2 -> erode FIELD_BUFFER_M
-        area <  ADAPTIVE_EROSION_MIN_AREA_M2 -> measure the farmer's polygon
-
-    The measured polygon is recorded per row (metadata.evidence) because the
-    two regimes are different physical definitions of "the field" and must
-    not be compared blindly across a trend.
+    Small fields are measured on the farmer polygon because exact fractional
+    coverage already handles mixed boundary cells. Larger fields retain the
+    existing -10 m erosion policy.
     """
     utm = utm_crs_for(geom)
     fwd = Transformer.from_crs("EPSG:4326", utm, always_xy=True).transform
     inv = Transformer.from_crs(utm, "EPSG:4326", always_xy=True).transform
-
     g_utm = shp_transform(fwd, geom)
     raw_area = g_utm.area
 
@@ -127,8 +69,8 @@ def measurement_field(geom):
     return shp_transform(inv, eroded), True, raw_area, eroded.area
 
 
-# Backwards-compatible alias (old name, 3-tuple) for any external caller.
 def buffered_field(geom):
+    """Backwards-compatible alias returning the historical 3-tuple."""
     g, applied, raw, _ = measurement_field(geom)
     return g, applied, raw
 
@@ -137,21 +79,7 @@ def buffered_field(geom):
 # EXACT FRACTIONAL COVERAGE
 # ---------------------------------------------------------------------------
 def coverage_fractions(geom_proj, transform, shape):
-    """
-    Exact fraction of each raster cell covered by `geom_proj`.
-
-    geom_proj : polygon ALREADY in the raster CRS (metres).
-    Returns (coverage float32 [0,1] of `shape`, method: str).
-
-    Computed analytically with shapely intersections - no sampling, no
-    approximation - so the identity
-
-        coverage.sum() * cell_area == polygon area inside the window
-
-    holds to floating-point precision and is asserted by the caller. Falls
-    back to binary coverage only for rotated grids or windows larger than
-    MAX_COVERAGE_CELLS, and reports which happened.
-    """
+    """Exact fraction of every raster cell covered by geom_proj."""
     h, w = shape
     a, b, _c, d, e, _f = transform.a, transform.b, transform.c, transform.d, transform.e, transform.f
     if b != 0 or d != 0:
@@ -188,13 +116,7 @@ def coverage_fractions(geom_proj, transform, shape):
 
 
 def bbox_cells(geom, cell_m: float = 10.0) -> int:
-    """
-    Hard upper bound on the number of `cell_m` grid cells any clip of
-    `geom` can contain, in either sampling mode: every cell (centre-sampled
-    OR all_touched) lies inside the UTM bounding box grown by one cell on
-    each axis. Used by the pixel-plausibility gate for narrow strips, where
-    all_touched legitimately touches ~2x the area-based count.
-    """
+    """Hard upper bound on native cells in the geometry bounding box."""
     utm = utm_crs_for(geom)
     fwd = Transformer.from_crs("EPSG:4326", utm, always_xy=True).transform
     minx, miny, maxx, maxy = shp_transform(fwd, geom).bounds
@@ -204,91 +126,92 @@ def bbox_cells(geom, cell_m: float = 10.0) -> int:
 
 
 # ---------------------------------------------------------------------------
-# REFLECTANCE SCALING  (P-17)
+# REFLECTANCE SCALING
 # ---------------------------------------------------------------------------
+def _baseline_number(item) -> float | None:
+    try:
+        value = str(item.properties.get("s2:processing_baseline", "")).strip()
+        return float(value) if value else None
+    except (TypeError, ValueError):
+        return None
+
+
 def band_scale_offset(item, band_key: str):
     """
-    (scale, offset) for a Sentinel-2 L2A asset.
+    Return (scale, physical_offset) for the asset.
 
-    Planetary Computer does NOT harmonise the BOA_ADD_OFFSET introduced with
-    processing baseline 04.00 (2022-01-25); DN carry a +1000 shift. Prefer
-    STAC raster:bands metadata when present; otherwise fall back to the
-    baseline rule. Returned offset is what is ADDED before scaling.
+    STAC raster:bands `offset` is in the scaled physical unit and therefore
+    MUST be applied after multiplication: physical = raw * scale + offset.
+
+    If raster:bands metadata are absent, Sentinel-2 baseline >= 04.00 uses
+    ESA's +1000 DN BOA shift, equivalent to physical_offset = -1000 * 1e-4.
+    The old implementation added the physical offset to DN before scaling,
+    which was dimensionally wrong and biased reflectance/NDVI.
     """
-    scale, offset = 1.0 / 10000.0, 0.0
+    default_scale = 1.0 / 10000.0
+    scale = default_scale
+    offset = 0.0
+    metadata_found = False
+
     try:
         raster_bands = item.assets[band_key].extra_fields.get("raster:bands")
         if raster_bands:
-            rb = raster_bands[0]
-            scale = float(rb.get("scale", scale))
-            offset = float(rb.get("offset", offset))
-    except Exception:
-        pass
+            rb = raster_bands[0] or {}
+            if rb.get("scale") is not None:
+                scale = float(rb["scale"])
+            if rb.get("offset") is not None:
+                offset = float(rb["offset"])
+            metadata_found = ("scale" in rb) or ("offset" in rb)
+    except (AttributeError, KeyError, TypeError, ValueError):
+        metadata_found = False
 
-    if offset == 0.0:
-        try:
-            baseline = str(item.properties.get("s2:processing_baseline", "")).strip()
-            if baseline and float(baseline) >= 4.0:
-                offset = -1000.0
-        except Exception:
-            pass
+    if not metadata_found and offset == 0.0:
+        baseline = _baseline_number(item)
+        if baseline is not None and baseline >= 4.0:
+            offset = -1000.0 * scale
+
+    if not np.isfinite(scale) or scale <= 0.0:
+        raise ValueError(f"Invalid STAC scale for {band_key}: {scale!r}")
+    if not np.isfinite(offset):
+        raise ValueError(f"Invalid STAC offset for {band_key}: {offset!r}")
     return scale, offset
 
 
 def to_reflectance(data: np.ndarray, item, band_key: str) -> np.ndarray:
-    """
-    DN -> surface reflectance. Masked / nodata cells become NaN.
-    Physically impossible values (< 0 after offset, > REFLECTANCE_MAX)
-    become NaN rather than being clipped into a plausible-looking number.
-    """
+    """Convert DN to surface reflectance with physically valid masking."""
     scale, offset = band_scale_offset(item, band_key)
-    arr = np.ma.filled(data.astype("float32"), np.nan)
     if np.ma.isMaskedArray(data):
+        arr = np.ma.filled(data.astype("float32"), np.nan)
         arr[np.ma.getmaskarray(data)] = np.nan
-    out = (arr + offset) * scale
+    else:
+        arr = np.asarray(data, dtype="float32")
+
+    # STAC semantics: scale first, then add the physical offset.
+    out = arr * scale + offset
     out[(out < 0.0) | (out > REFLECTANCE_MAX)] = np.nan
-    return out
+    return out.astype("float32", copy=False)
 
 
 # ---------------------------------------------------------------------------
 # BAND READ
 # ---------------------------------------------------------------------------
 def read_band(item, band_key: str, geometry, reference=None, categorical=False):
-    """
-    Read one band clipped to `geometry`.
-
-    Returns (array, transform, crs, coverage).
-      coverage : float32 [0,1] on THIS band's grid - the exact fraction of
-                 each cell inside the measurement polygon. For the reference
-                 band it is computed analytically; reprojected bands inherit
-                 the reference coverage. coverage > 0 replaces the old
-                 boolean footprint everywhere.
-
-    categorical=True  -> nearest-neighbour resampling, int16, fill 0 (SCL).
-    categorical=False -> bilinear, float32, fill NaN, DN -> reflectance.
-    """
+    """Read a band clipped to geometry and optionally reproject to reference."""
     asset = item.assets[band_key]
 
     with rasterio.open(asset.href) as src:
         geom_proj = reproject_geometry(geometry, src.crs)
         nodata = src.nodata if src.nodata is not None else 0
 
-        # SCL is read over a PADDED window so that a cloud / shadow lying just
-        # outside the boundary is still dilated into the field. The pad is
-        # the dilation distance plus one native cell. Pixel-native (m) CRS
-        # is guaranteed for Sentinel-2 (UTM).
         pad_m = 0.0
         if categorical and CLOUD_DILATION_PX > 0:
             pad_m = CLOUD_DILATION_PX * 10.0 + max(abs(src.res[0]), 10.0)
         clip_geom = geom_proj.buffer(pad_m) if pad_m else geom_proj
 
-        # v3: all_touched=True is now the SELECTION rule - every cell the
-        # polygon touches is a candidate. The exact coverage fraction, not
-        # the on/off mask, decides what each candidate is worth. Centre-only
-        # selection would drop real crop area on strips narrower than ~2 px.
-        data, transform = rio_mask(src, [mapping(clip_geom)], crop=True,
-                                   filled=False, all_touched=True,
-                                   nodata=nodata)
+        data, transform = rio_mask(
+            src, [mapping(clip_geom)], crop=True, filled=False,
+            all_touched=True, nodata=nodata,
+        )
         data = data[0] if data.ndim == 3 else data
 
         if reference is None:
@@ -297,11 +220,9 @@ def read_band(item, band_key: str, geometry, reference=None, categorical=False):
                 cov = (~np.ma.getmaskarray(data)).astype("float32")
                 logger.warning(f"coverage fallback ({cov_method}) for {band_key}")
         else:
-            cov = None          # inherited from the reference grid below
-            cov_method = "inherited"
+            cov = None
 
         inside = (cov > 0) if cov is not None else ~np.ma.getmaskarray(data)
-        # Genuine nodata INSIDE the polygon contributes nothing.
         inside &= (np.ma.getdata(data) != nodata)
         if cov is not None:
             cov = np.where(inside, cov, 0.0).astype("float32")
@@ -328,18 +249,22 @@ def read_band(item, band_key: str, geometry, reference=None, categorical=False):
 
         if categorical:
             dst = np.zeros(ref_shape, dtype="int16")
-            reproject(source=arr, destination=dst,
-                      src_transform=transform, src_crs=src.crs,
-                      dst_transform=ref_transform, dst_crs=ref_crs,
-                      src_nodata=0, dst_nodata=0,
-                      resampling=Resampling.nearest)
+            reproject(
+                source=arr, destination=dst,
+                src_transform=transform, src_crs=src.crs,
+                dst_transform=ref_transform, dst_crs=ref_crs,
+                src_nodata=0, dst_nodata=0,
+                resampling=Resampling.nearest,
+            )
         else:
             dst = np.full(ref_shape, np.nan, dtype="float32")
-            reproject(source=arr, destination=dst,
-                      src_transform=transform, src_crs=src.crs,
-                      dst_transform=ref_transform, dst_crs=ref_crs,
-                      src_nodata=np.nan, dst_nodata=np.nan,
-                      resampling=Resampling.bilinear)
+            reproject(
+                source=arr, destination=dst,
+                src_transform=transform, src_crs=src.crs,
+                dst_transform=ref_transform, dst_crs=ref_crs,
+                src_nodata=np.nan, dst_nodata=np.nan,
+                resampling=Resampling.bilinear,
+            )
             dst[~ref_footprint] = np.nan
         return dst, ref_transform, ref_crs, ref_coverage
 
@@ -348,13 +273,7 @@ def read_band(item, band_key: str, geometry, reference=None, categorical=False):
 # MASKING
 # ---------------------------------------------------------------------------
 def dilate_scl(scl: np.ndarray, native_res_m: float = 20.0) -> np.ndarray:
-    """
-    Grow SCL cloud (8/9/10) and cloud-shadow (3) classes by CLOUD_DILATION_PX
-    ten-metre pixels on the band's NATIVE grid. Grown cells are re-labelled
-    9 (cloud) or 3 (shadow) only where they overwrite a non-cloud, non-nodata
-    class, so class accounting stays exact. Applied BEFORE reprojection so the
-    padded clip window lets outside clouds reach into the field.
-    """
+    """Dilate SCL cloud/shadow classes on the native grid."""
     if CLOUD_DILATION_PX <= 0:
         return scl
     iters = max(1, int(np.ceil(CLOUD_DILATION_PX * 10.0 / max(native_res_m, 1.0))))
@@ -372,18 +291,7 @@ def dilate_scl(scl: np.ndarray, native_res_m: float = 20.0) -> np.ndarray:
 
 
 def scl_masks(scl: np.ndarray, coverage: np.ndarray = None) -> dict:
-    """
-    Decompose SCL into named masks over the field, with AREA-WEIGHTED
-    fractions.
-
-    coverage : per-cell coverage fraction from read_band(). Every reported
-               fraction is a share of FIELD AREA (sum of coverage), not a
-               share of touched cells - so a cloud clipping one corner of a
-               boundary cell no longer counts as a whole cloudy pixel.
-
-    Cloud (8,9,10) and cloud shadow (3) arrive already dilated by
-    CLOUD_DILATION_PX (see dilate_scl); the ring is counted as that class.
-    """
+    """Return area-weighted SCL masks over the measured field."""
     in_field = scl != 0
     if coverage is not None:
         w = np.where(in_field, coverage, 0.0).astype("float64")
@@ -393,18 +301,15 @@ def scl_masks(scl: np.ndarray, coverage: np.ndarray = None) -> dict:
     n = int(np.count_nonzero(in_field))
     epc_total = float(w.sum())
 
-    # Dilation already applied on the native grid by read_band()/dilate_scl().
-    cloud     = np.isin(scl, SCL_CLOUD)     & in_field
-    shadow    = np.isin(scl, SCL_SHADOW)    & in_field & ~cloud
-    dark      = np.isin(scl, SCL_DARK)      & in_field
-    water     = np.isin(scl, SCL_WATER)     & in_field & ~cloud & ~shadow
+    cloud = np.isin(scl, SCL_CLOUD) & in_field
+    shadow = np.isin(scl, SCL_SHADOW) & in_field & ~cloud
+    dark = np.isin(scl, SCL_DARK) & in_field
+    water = np.isin(scl, SCL_WATER) & in_field & ~cloud & ~shadow
     saturated = np.isin(scl, SCL_SATURATED) & in_field & ~cloud & ~shadow
-    snow      = np.isin(scl, SCL_SNOW)      & in_field & ~cloud & ~shadow
-    crop      = np.isin(scl, SCL_CROP_SURFACE) & in_field & ~cloud & ~shadow
+    snow = np.isin(scl, SCL_SNOW) & in_field & ~cloud & ~shadow
+    crop = np.isin(scl, SCL_CROP_SURFACE) & in_field & ~cloud & ~shadow
 
-    # AREA-weighted fraction (share of EPC), not cell-count fraction.
     frac = lambda m: (float(w[m].sum()) / epc_total) if epc_total > 0 else 0.0
-
     accounted = crop | cloud | shadow | water | saturated | snow | dark
     unaccounted = in_field & ~accounted
 
@@ -435,7 +340,7 @@ def scl_masks(scl: np.ndarray, coverage: np.ndarray = None) -> dict:
 
 
 def apply_crop_mask(bands: dict, masks: dict) -> dict:
-    """Set every non-crop-surface pixel to NaN across all spectral bands."""
+    """Set every non-crop-surface pixel to NaN across spectral bands."""
     keep = masks["crop"]
     return {
         k: (v if k == "SCL" else np.where(keep, v, np.nan))
@@ -446,18 +351,11 @@ def apply_crop_mask(bands: dict, masks: dict) -> dict:
 # ---------------------------------------------------------------------------
 # GEOMETRY RESOLUTION WITH HONEST CONFIDENCE
 # ---------------------------------------------------------------------------
-CENTROID_BUFFER_DEG = 0.00036   # ~40 m at Indian latitudes
+CENTROID_BUFFER_DEG = 0.00036
 
 
 def resolve_geometry(land: dict):
-    """
-    Returns (shapely_geometry, confidence) where confidence is
-    'high' | 'medium' | 'low'.
-
-    high   - PostGIS boundary_geom (surveyed; PostgREST serialises as GeoJSON)
-    medium - legacy boundary_polygon_old jsonb (not synchronised with the above)
-    low    - 40 m buffer around the centroid; no polygon exists at all
-    """
+    """Return (geometry, confidence) from surveyed/legacy land geometry."""
     from shapely.geometry import shape as _shape
 
     for key, conf in (("boundary_geom", "high"),
