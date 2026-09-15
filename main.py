@@ -1,29 +1,9 @@
 """
 main.py - NDVI pipeline entrypoint (GitHub Actions: `python main.py`).
 
-Exit codes:
-  0  run completed; at least one acquisition accepted
-  1  fatal error
-  2  ran cleanly but accepted ZERO acquisitions (optical or radar) - FAILURE
-
-The version reported in logs and in ndvi_run_summary.notes is taken from
-processor.PIPELINE_VERSION - the same constant stamped into every row's
-metadata - so a run can never again report v2.2 while writing v3.0 rows.
-
-v2.2 CHANGES (forensic audit 2026-08-29)
-----------------------------------------
-F-3  A radar-only land NEVER overwrites lands.last_ndvi_value. The optical
-     cache is updated only from an optical row; radar runs set
-     ndvi_status='completed' with a note.
-F-6  The run summary distinguishes observations_written (rows upserted) from
-     observations_new (rows created this run). The zero-data guard keys on
-     accepted acquisitions, not on re-upserts.
-F-11 The stage-anomaly RPC was never reachable (lands has no
-     cultivation_method / sowing_date); the call is removed. The 21-day
-     trend over this run's optical rows is now written to
-     ndvi_processing_logs.metadata for traceability.
-NEW  Per-scene errors are logged as SCENE_ERROR rows; stale-history NDVI
-     jumps are flagged by processor.flag_temporal_outliers.
+Parcel-context enrichment is run after the existing observation processor.
+The observed parcel NDVI contract remains unchanged; context is persisted in
+metadata.parcel_context as separate same-scene evidence.
 """
 
 import sys
@@ -35,7 +15,8 @@ from db import (
     iter_lands, count_eligible_lands, upsert_observations, optical_history,
     update_land_snapshot, mark_land_status, log_step, write_run_summary,
 )
-from processor import process_land, PIPELINE_VERSION
+from processor import PIPELINE_VERSION
+from context_enrichment import process_land_with_context
 from tile_grouping import group_lands_by_tile, scenes_for_group, log_group_plan
 from phenology import classify_trend
 from config import TILE_WORKERS, LOOKBACK_DAYS, BACKFILL_DAYS, TEMPORAL_LOOKBACK_DAYS
@@ -54,8 +35,9 @@ def handle_land(land: dict, lookback: int, run_started: datetime, scenes=None) -
 
     try:
         history = optical_history(land_id, TEMPORAL_LOOKBACK_DAYS)
-        rows, report = process_land(land, lookback_days=lookback, scenes=scenes,
-                                    history=history)
+        rows, report = process_land_with_context(
+            land, lookback_days=lookback, scenes=scenes, history=history
+        )
 
         for err in report.get("scene_errors", []):
             log_step(processing_step="SCENE_ERROR", step_status="failed",
@@ -72,6 +54,7 @@ def handle_land(land: dict, lookback: int, run_started: datetime, scenes=None) -
                                "lookback_days": lookback,
                                "items_searched": report.get("items"),
                                "optical_rejects": report.get("optical_rejects", [])[:6],
+                               "parcel_context": report.get("parcel_context"),
                                "geometry_confidence": report.get("geometry_confidence")})
             return result
 
@@ -99,7 +82,6 @@ def handle_land(land: dict, lookback: int, run_started: datetime, scenes=None) -
                 and h.get("scene_id") not in {r["scene_id"] for r in optical}
             ])
         else:
-            # F-3: radar-only. Do NOT touch the optical cache.
             mark_land_status(land_id, "completed",
                              f"radar-only ({newest['acquisition_date']}); optical cache retained")
 
@@ -115,6 +97,7 @@ def handle_land(land: dict, lookback: int, run_started: datetime, scenes=None) -
                            "optical_count": len(optical),
                            "items_searched": report.get("items"),
                            "tile_duplicates_removed": report.get("deduped"),
+                           "parcel_context": report.get("parcel_context"),
                            "temporal_outliers": [r["acquisition_date"] for r in optical
                                                  if r.get("metadata", {}).get("temporal_outlier")],
                            "trend_21d": trend,
@@ -145,7 +128,7 @@ def main() -> int:
 
     total = count_eligible_lands(args.tenant)
     logger.info(f"NDVI {PIPELINE_VERSION} start | eligible_lands={total} | lookback={lookback}d "
-                f"| tenant={args.tenant or 'ALL'}")
+                f"| tenant={args.tenant or 'ALL'} | parcel_context=enabled")
 
     if args.dry_run:
         for i, land in enumerate(iter_lands(args.tenant)):
@@ -154,7 +137,7 @@ def main() -> int:
 
     stats = {"lands": 0, "completed": 0, "skipped": 0, "failed": 0,
              "observations": 0, "new_observations": 0, "unverified_new": 0,
-             "optical": 0, "radar": 0}
+             "optical": 0, "radar": 0, "context_enriched": 0, "context_failed": 0}
 
     groups = group_lands_by_tile(iter_lands(args.tenant))
     log_group_plan(groups)
@@ -209,7 +192,8 @@ def main() -> int:
         "tenant_id": args.tenant,
         "notes": {"observations_new": stats["new_observations"],
                   "lands_new_count_unverified": stats["unverified_new"],
-                  "pipeline_version": PIPELINE_VERSION},
+                  "pipeline_version": PIPELINE_VERSION,
+                  "parcel_context": "enabled; observed_context_only"},
     }
     write_run_summary(summary)
 
@@ -219,6 +203,8 @@ def main() -> int:
                 f"{stats['skipped']} skipped / {stats['failed']} failed)  skip_rate={skip_rate}%")
     logger.info(f"  observations: {stats['observations']} upserted, "
                 f"{stats['new_observations']} NEW (optical lands {stats['optical']} / radar {stats['radar']})")
+    logger.info("  parcel context: extracted for accepted optical observations; "
+                "stored separately from observed NDVI")
     logger.info("=" * 72)
 
     if stats["observations"] == 0:
