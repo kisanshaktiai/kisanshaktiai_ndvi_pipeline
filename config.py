@@ -265,3 +265,27 @@ DEDUPE_TILE_OVERLAP = True
 TEMPORAL_MAX_DELTA = 0.35
 TEMPORAL_WINDOW_DAYS = 7
 TEMPORAL_LOOKBACK_DAYS = 45
+
+
+# ===========================================================================
+# NDVI IMAGERY  (v3.1)
+# ===========================================================================
+# The pipeline renders one PNG per OBSERVATION and stores its storage PATH
+# in ndvi_data.image_url. The bucket is PRIVATE; the app mints a signed URL
+# on read, so no farmer's field imagery is reachable by anyone holding a
+# bare land UUID.
+ENABLE_NDVI_IMAGES = True
+NDVI_IMAGE_BUCKET = "ndvi-thumbnails"
+
+# Output grid. A 0.25 acre field is ~10 native pixels across, so the PNG is
+# deliberately larger than the data: MapLibre stretches it across the
+# polygon bbox, and nearest-neighbour upsampling keeps every original pixel
+# visible as a hard-edged block instead of a blur. No value is invented -
+# the block boundaries ARE the 10 m Sentinel-2 grid.
+NDVI_IMAGE_MAX_PX = 512
+NDVI_IMAGE_MIN_PX = 64
+
+# Lifetime of the signed URL the app requests (seconds). Short enough that a
+# leaked link dies quickly, long enough to survive a farmer scrubbing
+# through dates on a slow rural connection.
+NDVI_IMAGE_SIGNED_URL_TTL = 3600

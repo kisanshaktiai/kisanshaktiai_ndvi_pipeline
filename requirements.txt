@@ -8,3 +8,4 @@ scipy
 supabase
 pyproj
 matplotlib
+pillow

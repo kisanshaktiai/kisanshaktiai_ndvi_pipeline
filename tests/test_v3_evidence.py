@@ -214,3 +214,88 @@ def test_run_version_matches_row_version():
     assert "PIPELINE_VERSION" in src
     assert not re.search(r'NDVI v\d+\.\d+ (start|finished)', src)
     assert '"pipeline_version": "v2' not in src
+
+
+# ===========================================================================
+# v3.1 FIELD IMAGERY
+# ===========================================================================
+def test_ndvi_png_is_warped_to_polygon_wgs84_bbox():
+    """The app adds the PNG as a MapLibre image source pinned to
+    computeBounds(boundary) - the polygon's WGS84 bbox, north-up. If the
+    pipeline handed over the native UTM window the heatmap would sit
+    crooked and offset over the farmer's field."""
+    import raster_io
+    from rasterio.transform import from_origin
+    from shapely.ops import transform as shp_transform
+    from pyproj import Transformer
+    from shapely.geometry import box as _b
+
+    tr = from_origin(400000, 1900000, 10, 10)
+    ndvi = np.tile(np.linspace(0.15, 0.85, 12), (10, 1)).astype("float32")
+    vis = np.ones((10, 12), dtype="float32")
+    inv = Transformer.from_crs("EPSG:32643", "EPSG:4326", always_xy=True).transform
+    poly = shp_transform(inv, _b(400000, 1899900, 400120, 1900000))
+
+    png, meta = raster_io.render_ndvi_png(ndvi, vis, tr, "EPSG:32643", poly)
+    assert meta["crs"] == "EPSG:4326"
+    w, s, e, n = poly.bounds
+    assert abs(meta["bounds_wgs84"]["west"] - w) < 1e-12
+    assert abs(meta["bounds_wgs84"]["north"] - n) < 1e-12
+    # aspect must follow GROUND distance (120 x 100 m), not degrees
+    assert abs(meta["width"] / meta["height"] - 1.2) < 0.06
+    assert meta["resampling"] == "nearest"          # never invent a value
+    assert png[:8] == b"\x89PNG\r\n\x1a\n"
+
+
+def test_masked_cells_are_transparent_not_coloured():
+    """Cloud, shadow, non-crop and out-of-polygon cells must be absent from
+    the image, not painted a colour the farmer would read as a measurement."""
+    import raster_io
+    from rasterio.transform import from_origin
+    from shapely.ops import transform as shp_transform
+    from pyproj import Transformer
+    from shapely.geometry import box as _b
+    from PIL import Image
+    import io as _io
+
+    tr = from_origin(400000, 1900000, 10, 10)
+    ndvi = np.full((10, 12), 0.6, dtype="float32")
+    vis = np.ones((10, 12), dtype="float32")
+    vis[0:5, 0:6] = 0.0                              # half the field masked
+    inv = Transformer.from_crs("EPSG:32643", "EPSG:4326", always_xy=True).transform
+    poly = shp_transform(inv, _b(400000, 1899900, 400120, 1900000))
+
+    png, meta = raster_io.render_ndvi_png(ndvi, vis, tr, "EPSG:32643", poly)
+    im = np.array(Image.open(_io.BytesIO(png)))
+    transparent = int((im[..., 3] == 0).sum())
+    opaque = int((im[..., 3] == 255).sum())
+    assert transparent > 0 and opaque > 0
+    assert abs(transparent / (transparent + opaque) - 0.25) < 0.05   # quarter masked
+
+
+def test_colour_ramp_matches_the_app_legend():
+    """NDVI_STOPS is a copy of src/lib/ndviScience.ts NDVI_COLOR_STOPS. If the
+    two drift the on-screen legend describes a picture it did not produce."""
+    import raster_io
+    assert raster_io.NDVI_STOPS[0] == (-0.20, "#7C3F1C")
+    assert raster_io.NDVI_STOPS[-1] == (1.00, "#1B5E20")
+    # exact stop values must reproduce their own hex
+    for value, hex_ in raster_io.NDVI_STOPS:
+        rgb = tuple(int(x) for x in raster_io.colorize(np.array([value]))[0])
+        assert rgb == raster_io._hex_to_rgb(hex_), (value, hex_, rgb)
+
+
+def test_storage_path_is_per_observation_and_tenant_first():
+    """Tenant segment first, because the storage RLS policy authorises on
+    (storage.foldername(name))[1]. One object per acquisition, so an August
+    metric can never sit beside a June picture again."""
+    import raster_io
+    p = raster_io.storage_path("11111111-1111-1111-1111-111111111111",
+                               "22222222-2222-2222-2222-222222222222",
+                               "2026-08-21", "S2C_MSIL2A_20260821T052641_R105_T43QDU")
+    assert p.startswith("11111111-1111-1111-1111-111111111111/")
+    assert p.split("/")[1] == "22222222-2222-2222-2222-222222222222"
+    assert p.endswith(".png") and "2026-08-21" in p
+    # a scene id with awkward characters must not escape the folder
+    weird = raster_io.storage_path("t", "l", "2026-08-21", "../../etc/passwd")
+    assert ".." not in weird.split("/")[-1] and weird.count("/") == 2

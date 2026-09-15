@@ -49,16 +49,29 @@ from indices import (compute_indices, validate_index, index_statistics,
                      weighted_index_statistics, weighted_histogram)
 from sar_vegetation import rvi_from_gamma0
 from quality import assess, evidence_tier
+from raster_io import render_ndvi_png, storage_path, upload_png
 from config import (
     FIELD_BUFFER_M, NDVI_DECIMALS, ENABLE_S1_FALLBACK, NDVI_HISTOGRAM_BINS,
     QUALITY_SATURATION_PIXELS, MICRO_LAND_ACRES, MICRO_LAND_FACTOR,
     GEOMETRY_CONFIDENCE_FACTOR, PIXEL_AREA_M2, PIXEL_COUNT_TOLERANCE,
     DEDUPE_TILE_OVERLAP, TEMPORAL_MAX_DELTA, TEMPORAL_WINDOW_DAYS,
     CLOUD_DILATION_PX, SPATIAL_STAT_METHOD, MIN_EPC, EPC_SATURATION,
+    ENABLE_NDVI_IMAGES,
 )
 from logger import logger
 
-PIPELINE_VERSION = "v3.0.1"
+PIPELINE_VERSION = "v3.1"
+
+from config import NDVI_IMAGE_BUCKET
+
+
+def _supabase():
+    """
+    Lazy handle. Imported inside the call so this module stays importable
+    (and unit-testable) without Supabase credentials in the environment.
+    """
+    from db import supabase
+    return supabase
 
 # 10 m reference bands + the 20 m bands we resample onto them.
 S2_BANDS_10M = ["B02", "B03", "B04", "B08"]
@@ -155,7 +168,8 @@ def process_acquisition(item, geom_measured, buffer_applied: bool,
                         raw_area_m2: float = None,
                         reject_sink: Optional[list] = None,
                         error_sink: Optional[list] = None,
-                        measured_area_m2: float = None) -> Optional[dict]:
+                        measured_area_m2: float = None,
+                        geom_wgs84=None) -> Optional[dict]:
     """
     Process ONE Sentinel-2 acquisition over ONE field.
     Returns a complete row dict, or None if the acquisition is rejected.
@@ -346,8 +360,40 @@ def process_acquisition(item, geom_measured, buffer_applied: bool,
         row["measurement_status"] = qa.measurement_status
         row["spatial_stat_method"] = SPATIAL_STAT_METHOD
 
+        # ---- FIELD IMAGE ----------------------------------------------
+        # Rendered from the SAME array the statistics came from, so the
+        # picture and the number can never describe different things -
+        # the mismatch the first forensic audit found when an August
+        # metric sat beside a June PNG.
+        image_meta = None
+        if ENABLE_NDVI_IMAGES and geom_wgs84 is not None:
+            try:
+                rendered = render_ndvi_png(
+                    ndvi=idx.get("NDVI"),
+                    visible=crop_w,
+                    src_transform=ref_transform,
+                    src_crs=ref_crs,
+                    geom_wgs84=geom_wgs84,
+                )
+                if rendered:
+                    png, image_meta = rendered
+                    path = storage_path(land["tenant_id"], land["id"],
+                                        meta["acquisition_date"], meta["scene_id"])
+                    stored = upload_png(_supabase(), path, png)
+                    if stored:
+                        row["image_url"] = stored          # PATH, not a URL
+                        image_meta["storage_path"] = stored
+                        image_meta["bucket"] = NDVI_IMAGE_BUCKET
+                    else:
+                        image_meta["upload_failed"] = True
+            except Exception as e:
+                logger.warning(f"NDVI image step failed for land {land['id']} "
+                               f"scene {meta['scene_id']}: {type(e).__name__}: {e}")
+                image_meta = {"error": f"{type(e).__name__}: {str(e)[:200]}"}
+
         row["metadata"] = {
             "evidence": evidence,
+            "image": image_meta,
             "quality_breakdown": qa.to_dict(),
             "index_quality": index_quality,
             "scene_cloud_cover": meta["scene_cloud_cover"],
@@ -445,7 +491,8 @@ def process_land(land: dict, lookback_days: int = None,
                                 raw_area_m2=raw_area_m2,
                                 reject_sink=report["optical_rejects"],
                                 error_sink=report["scene_errors"],
-                                measured_area_m2=measured_area_m2)
+                                measured_area_m2=measured_area_m2,
+                                geom_wgs84=geom_meas)
         if r:
             r["field_area_m2"] = round(raw_area_m2, 1)
             rows.append(r)
