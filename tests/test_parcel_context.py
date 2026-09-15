@@ -48,6 +48,6 @@ def test_same_scene_context_excludes_parcel_and_preserves_observed_semantics(mon
 def test_parcel_delta_is_not_a_diagnosis():
     context = {"context_ndvi_median": 0.60, "context_ndvi_mad": 0.05}
     result = pc.add_parcel_delta(context, 0.50)
-    assert result["parcel_context_delta"] == -0.10
+    assert np.isclose(result["parcel_context_delta"], -0.10)
     assert result["parcel_context_robust_z"] < 0
     assert "diagnosis" not in result
