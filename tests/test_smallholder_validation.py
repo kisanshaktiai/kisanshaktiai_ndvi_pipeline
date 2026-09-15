@@ -20,7 +20,8 @@ class SmallholderValidationTests(unittest.TestCase):
     def test_weighted_median_mad(self):
         med, mad = robust_location(np.array([0.2, 0.3, 0.4]), np.array([1.0, 2.0, 1.0]))
         self.assertEqual(med, 0.3)
-        self.assertAlmostEqual(mad, 0.1, places=6)
+        # Weighted median has mass 0.5 at 0.3, so the weighted MAD is exactly 0.
+        self.assertAlmostEqual(mad, 0.0, places=6)
 
     def test_validation_requires_independent_reference(self):
         rows = [
