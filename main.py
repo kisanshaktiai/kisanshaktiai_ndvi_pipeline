@@ -1,4 +1,4 @@
-"""NDVI pipeline entrypoint with separate observed parcel-context evidence."""
+"""NDVI pipeline entrypoint with separate observed parcel-context and water evidence."""
 
 import sys
 import argparse
@@ -11,6 +11,7 @@ from db import (
 )
 from processor import PIPELINE_VERSION
 from context_enrichment import process_land_with_context
+from water_layer_runner import process_land_water_layers
 from tile_grouping import group_lands_by_tile, scenes_for_group, log_group_plan
 from phenology import classify_trend
 from config import TILE_WORKERS, LOOKBACK_DAYS, BACKFILL_DAYS, TEMPORAL_LOOKBACK_DAYS
@@ -22,7 +23,7 @@ def handle_land(land: dict, lookback: int, run_started: datetime, scenes=None) -
     started = datetime.now(timezone.utc)
     result = {"land_id": land_id, "rows": 0, "new_rows": 0, "source": None,
               "status": "skipped", "error": None, "context_enriched": 0,
-              "context_failed": 0}
+              "context_failed": 0, "water_layers": 0}
 
     log_step(processing_step="PROCESS_START", step_status="started",
              tenant_id=tenant_id, land_id=land_id, started_at=started)
@@ -34,6 +35,19 @@ def handle_land(land: dict, lookback: int, run_started: datetime, scenes=None) -
         context_report = report.get("parcel_context") or {}
         result["context_enriched"] = int(context_report.get("rows_enriched") or 0)
         result["context_failed"] = int(context_report.get("rows_failed") or 0)
+
+        # Water layers are observational evidence and are intentionally
+        # generated independently of NDVI acceptance. No water-stress
+        # threshold or agronomic recommendation is made here.
+        try:
+            result["water_layers"] = process_land_water_layers(
+                land, scenes=scenes, lookback_days=lookback
+            )
+        except Exception as water_exc:
+            logger.warning(f"Water-layer pass failed for land {land_id}: {type(water_exc).__name__}: {water_exc}")
+            log_step(processing_step="WATER_LAYER_ERROR", step_status="failed",
+                     tenant_id=tenant_id, land_id=land_id, started_at=started,
+                     error_message=str(water_exc)[:1000])
 
         for err in report.get("scene_errors", []):
             log_step(processing_step="SCENE_ERROR", step_status="failed",
@@ -51,6 +65,7 @@ def handle_land(land: dict, lookback: int, run_started: datetime, scenes=None) -
                                "items_searched": report.get("items"),
                                "optical_rejects": report.get("optical_rejects", [])[:6],
                                "parcel_context": context_report,
+                               "water_layers": result["water_layers"],
                                "geometry_confidence": report.get("geometry_confidence")})
             return result
 
@@ -88,6 +103,7 @@ def handle_land(land: dict, lookback: int, run_started: datetime, scenes=None) -
                            "optical_count": len(optical), "items_searched": report.get("items"),
                            "tile_duplicates_removed": report.get("deduped"),
                            "parcel_context": context_report,
+                           "water_layers": result["water_layers"],
                            "temporal_outliers": [r["acquisition_date"] for r in optical
                                                  if r.get("metadata", {}).get("temporal_outlier")],
                            "trend_21d": trend,
@@ -115,7 +131,7 @@ def main() -> int:
 
     total = count_eligible_lands(args.tenant)
     logger.info(f"NDVI {PIPELINE_VERSION} start | eligible_lands={total} | lookback={lookback}d "
-                f"| tenant={args.tenant or 'ALL'} | parcel_context=enabled")
+                f"| tenant={args.tenant or 'ALL'} | parcel_context=enabled | water_layers=enabled")
     if args.dry_run:
         for i, land in enumerate(iter_lands(args.tenant)):
             logger.info(f"[dry-run] {i+1}/{total} {land['id']} crop={land.get('current_crop')}")
@@ -123,7 +139,8 @@ def main() -> int:
 
     stats = {"lands": 0, "completed": 0, "skipped": 0, "failed": 0,
              "observations": 0, "new_observations": 0, "unverified_new": 0,
-             "optical": 0, "radar": 0, "context_enriched": 0, "context_failed": 0}
+             "optical": 0, "radar": 0, "context_enriched": 0, "context_failed": 0,
+             "water_layers": 0}
     groups = group_lands_by_tile(iter_lands(args.tenant))
     log_group_plan(groups)
 
@@ -150,6 +167,7 @@ def main() -> int:
             stats["observations"] += r["rows"]
             stats["context_enriched"] += r.get("context_enriched", 0)
             stats["context_failed"] += r.get("context_failed", 0)
+            stats["water_layers"] += r.get("water_layers", 0)
             if r["new_rows"] >= 0:
                 stats["new_observations"] += r["new_rows"]
             else:
@@ -173,6 +191,8 @@ def main() -> int:
                   "lands_new_count_unverified": stats["unverified_new"],
                   "pipeline_version": PIPELINE_VERSION,
                   "parcel_context": "enabled; observed_context_only",
+                  "water_layers": "enabled; observed spectral evidence only",
+                  "water_layer_rows_written": stats["water_layers"],
                   "parcel_context_rows_enriched": stats["context_enriched"],
                   "parcel_context_rows_failed": stats["context_failed"]},
     }
@@ -182,6 +202,7 @@ def main() -> int:
     logger.info(f"  lands: {stats['lands']} processed ({stats['completed']} ok / {stats['skipped']} skipped / {stats['failed']} failed) skip_rate={skip_rate}%")
     logger.info(f"  observations: {stats['observations']} upserted, {stats['new_observations']} NEW (optical lands {stats['optical']} / radar {stats['radar']})")
     logger.info(f"  parcel context: {stats['context_enriched']} rows enriched / {stats['context_failed']} failed; observed_context_only")
+    logger.info(f"  water layers: {stats['water_layers']} observed layer rows")
     logger.info("=" * 72)
     if stats["observations"] == 0:
         logger.error("ZERO acquisitions accepted. Treating as FAILURE. Check STAC availability, cloud conditions, SCL thresholds, S1 fallback.")
