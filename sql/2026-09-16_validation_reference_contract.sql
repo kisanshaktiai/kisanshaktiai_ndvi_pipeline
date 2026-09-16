@@ -31,6 +31,6 @@ DO $$ BEGIN
   CREATE POLICY satellite_validation_reference_tenant_read
     ON public.satellite_validation_reference
     FOR SELECT TO authenticated
-    USING (tenant_id = (select auth.uid()));
+    USING (has_tenant_access(tenant_id));
 EXCEPTION WHEN duplicate_object THEN NULL;
 END $$;
