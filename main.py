@@ -1,4 +1,4 @@
-"""NDVI pipeline entrypoint with separate observed parcel-context and water evidence."""
+"""NDVI pipeline entrypoint with separate observed parcel-context, water evidence, and intelligence persistence."""
 
 import sys
 import argparse
@@ -12,6 +12,7 @@ from db import (
 from processor import PIPELINE_VERSION
 from context_enrichment import process_land_with_context
 from water_layer_runner import process_land_water_layers
+from ndvi_intelligence_writer import persist_observed_intelligence
 from tile_grouping import group_lands_by_tile, scenes_for_group, log_group_plan
 from phenology import classify_trend
 from config import TILE_WORKERS, LOOKBACK_DAYS, BACKFILL_DAYS, TEMPORAL_LOOKBACK_DAYS
@@ -23,7 +24,8 @@ def handle_land(land: dict, lookback: int, run_started: datetime, scenes=None) -
     started = datetime.now(timezone.utc)
     result = {"land_id": land_id, "rows": 0, "new_rows": 0, "source": None,
               "status": "skipped", "error": None, "context_enriched": 0,
-              "context_failed": 0, "water_layers": 0}
+              "context_failed": 0, "water_layers": 0, "intelligence_written": 0,
+              "intelligence_failed": 0}
 
     log_step(processing_step="PROCESS_START", step_status="started",
              tenant_id=tenant_id, land_id=land_id, started_at=started)
@@ -70,6 +72,37 @@ def handle_land(land: dict, lookback: int, run_started: datetime, scenes=None) -
             return result
 
         written, new = upsert_observations(rows, run_started_at=run_started)
+
+        # Every accepted optical observation must also have an observed
+        # intelligence record. This is a persistence stage, not an ML
+        # prediction: estimated_ndvi/model_version remain NULL until a
+        # separately validated model exists.
+        intelligence_failed = 0
+        intelligence_written = 0
+        for row in rows:
+            if row.get("observation_source") != "sentinel-2" or row.get("ndvi_value") is None:
+                continue
+            try:
+                if persist_observed_intelligence(row):
+                    intelligence_written += 1
+            except Exception as intelligence_exc:
+                intelligence_failed += 1
+                log_step(
+                    processing_step="INTELLIGENCE_PERSIST_ERROR",
+                    step_status="failed",
+                    tenant_id=tenant_id,
+                    land_id=land_id,
+                    started_at=started,
+                    error_message=str(intelligence_exc)[:1000],
+                    metadata={"scene_id": row.get("scene_id")},
+                )
+                logger.exception(
+                    "Observed intelligence persistence failed land=%s scene=%s",
+                    land_id, row.get("scene_id"),
+                )
+        result["intelligence_written"] = intelligence_written
+        result["intelligence_failed"] = intelligence_failed
+
         newest = max(rows, key=lambda r: (r["acquisition_date"], r.get("acquisition_time") or ""))
         optical = [r for r in rows if r.get("ndvi_value") is not None]
         trend = None
@@ -93,11 +126,30 @@ def handle_land(land: dict, lookback: int, run_started: datetime, scenes=None) -
             mark_land_status(land_id, "completed",
                              f"radar-only ({newest['acquisition_date']}); optical cache retained")
 
+        if intelligence_failed > 0:
+            result.update(rows=written, new_rows=new, status="failed",
+                          source=newest.get("observation_source"),
+                          error=f"{intelligence_failed} accepted optical observation(s) failed intelligence persistence")
+            log_step(
+                processing_step="PROCESS_DEGRADED",
+                step_status="failed",
+                tenant_id=tenant_id,
+                land_id=land_id,
+                started_at=started,
+                error_message=result["error"],
+                metadata={"observations_upserted": written,
+                          "intelligence_written": intelligence_written,
+                          "intelligence_failed": intelligence_failed},
+            )
+            return result
+
         result.update(rows=written, new_rows=new, status="completed",
                       source=newest.get("observation_source"))
         log_step(processing_step="PROCESS_END", step_status="completed",
                  tenant_id=tenant_id, land_id=land_id, started_at=started,
                  metadata={"observations_upserted": written, "observations_new": new,
+                           "intelligence_written": intelligence_written,
+                           "intelligence_failed": intelligence_failed,
                            "source": newest.get("observation_source"),
                            "newest_acquisition": newest["acquisition_date"],
                            "optical_count": len(optical), "items_searched": report.get("items"),
@@ -131,7 +183,7 @@ def main() -> int:
 
     total = count_eligible_lands(args.tenant)
     logger.info(f"NDVI {PIPELINE_VERSION} start | eligible_lands={total} | lookback={lookback}d "
-                f"| tenant={args.tenant or 'ALL'} | parcel_context=enabled | water_layers=enabled")
+                f"| tenant={args.tenant or 'ALL'} | parcel_context=enabled | water_layers=enabled | intelligence_persist=enabled")
     if args.dry_run:
         for i, land in enumerate(iter_lands(args.tenant)):
             logger.info(f"[dry-run] {i+1}/{total} {land['id']} crop={land.get('current_crop')}")
@@ -140,7 +192,7 @@ def main() -> int:
     stats = {"lands": 0, "completed": 0, "skipped": 0, "failed": 0,
              "observations": 0, "new_observations": 0, "unverified_new": 0,
              "optical": 0, "radar": 0, "context_enriched": 0, "context_failed": 0,
-             "water_layers": 0}
+             "water_layers": 0, "intelligence_written": 0, "intelligence_failed": 0}
     groups = group_lands_by_tile(iter_lands(args.tenant))
     log_group_plan(groups)
 
@@ -168,6 +220,8 @@ def main() -> int:
             stats["context_enriched"] += r.get("context_enriched", 0)
             stats["context_failed"] += r.get("context_failed", 0)
             stats["water_layers"] += r.get("water_layers", 0)
+            stats["intelligence_written"] += r.get("intelligence_written", 0)
+            stats["intelligence_failed"] += r.get("intelligence_failed", 0)
             if r["new_rows"] >= 0:
                 stats["new_observations"] += r["new_rows"]
             else:
@@ -194,19 +248,25 @@ def main() -> int:
                   "water_layers": "enabled; observed spectral evidence only",
                   "water_layer_rows_written": stats["water_layers"],
                   "parcel_context_rows_enriched": stats["context_enriched"],
-                  "parcel_context_rows_failed": stats["context_failed"]},
+                  "parcel_context_rows_failed": stats["context_failed"],
+                  "intelligence_rows_written": stats["intelligence_written"],
+                  "intelligence_rows_failed": stats["intelligence_failed"]},
     }
     write_run_summary(summary)
     logger.info("=" * 72)
     logger.info(f"NDVI {PIPELINE_VERSION} finished in {duration:.0f}s")
     logger.info(f"  lands: {stats['lands']} processed ({stats['completed']} ok / {stats['skipped']} skipped / {stats['failed']} failed) skip_rate={skip_rate}%")
     logger.info(f"  observations: {stats['observations']} upserted, {stats['new_observations']} NEW (optical lands {stats['optical']} / radar {stats['radar']})")
+    logger.info(f"  intelligence: {stats['intelligence_written']} observed records upserted / {stats['intelligence_failed']} failed")
     logger.info(f"  parcel context: {stats['context_enriched']} rows enriched / {stats['context_failed']} failed; observed_context_only")
     logger.info(f"  water layers: {stats['water_layers']} observed layer rows")
     logger.info("=" * 72)
     if stats["observations"] == 0:
         logger.error("ZERO acquisitions accepted. Treating as FAILURE. Check STAC availability, cloud conditions, SCL thresholds, S1 fallback.")
         return 2
+    if stats["intelligence_failed"] > 0:
+        logger.error(f"{stats['intelligence_failed']} accepted optical observation(s) failed intelligence persistence.")
+        return 3
     if stats["failed"] > 0 and stats["failed"] >= stats["completed"]:
         logger.error(f"{stats['failed']} lands failed vs {stats['completed']} completed - degraded run.")
     if skip_rate >= 80.0:
