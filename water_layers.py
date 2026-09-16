@@ -1,9 +1,8 @@
 """Observed water-related Sentinel-2 layers.
 
-Creates surface_water_trace (MNDWI + SCL water evidence) and
-canopy_moisture_signal (NDMI using the Sentinel-2 B8A/B11 moisture-index
-combination). No agronomic threshold or water-stress classification is
-performed here; presentation ramps come from DB config.
+Creates surface_water_trace (MNDWI evidence) and canopy_moisture_signal
+(NDMI using the Sentinel-2 B8A/B11 moisture-index combination).
+No agronomic water-stress classification is performed here.
 """
 from __future__ import annotations
 import io
@@ -25,8 +24,9 @@ def _ratio(a, b):
 
 def _config(layer_code):
     res = with_retry(lambda: supabase.table("satellite_layer_config").select(
-        "value_min,value_max,color_stops").eq("layer_code", layer_code).eq(
-        "enabled", True).limit(1).execute(), what=f"water layer config {layer_code}", attempts=2)
+        "value_min,value_max,evidence_min,color_stops"
+    ).eq("layer_code", layer_code).eq("enabled", True).limit(1).execute(),
+        what=f"water layer config {layer_code}", attempts=2)
     if not res.data:
         raise RuntimeError(f"No enabled satellite_layer_config for {layer_code}")
     return res.data[0]
@@ -56,7 +56,17 @@ def _render(values, visible, geom_wgs84, src_transform, src_crs, layer_code):
     else:
         height, width = max_px, max(64, int(round(max_px * dx / dy)))
     dst_transform = from_bounds(w, s, e, n, width, height)
-    src = np.where(np.asarray(visible, dtype=bool) & np.isfinite(values), values, np.nan).astype("float32")
+
+    # Continuous index values are retained for measurement/statistics, but the
+    # farmer-facing surface-water layer must show only spatial evidence pixels.
+    # The evidence cutoff is controlled by satellite_layer_config, never TS.
+    evidence_min = cfg.get("evidence_min")
+    if layer_code == "surface_water_trace" and evidence_min is not None:
+        evidence = np.isfinite(values) & (values >= float(evidence_min))
+    else:
+        evidence = np.isfinite(values)
+
+    src = np.where(np.asarray(visible, dtype=bool) & evidence, values, np.nan).astype("float32")
     dst = np.full((height, width), np.nan, dtype="float32")
     reproject(source=src, destination=dst, src_transform=src_transform, src_crs=src_crs,
               dst_transform=dst_transform, dst_crs="EPSG:4326", src_nodata=np.nan,
@@ -64,15 +74,27 @@ def _render(values, visible, geom_wgs84, src_transform, src_crs, layer_code):
     drawn = np.isfinite(dst)
     if not drawn.any():
         return None
+
     rgba = np.zeros((height, width, 4), dtype=np.uint8)
     rgba[..., :3] = _rgb(dst, cfg["color_stops"])
-    rgba[..., 3] = np.where(drawn, 255, 0).astype(np.uint8)
+    # Non-evidence pixels are fully transparent, so the farmer sees the real
+    # location of the signal over the satellite basemap instead of a gray tile.
+    rgba[..., 3] = np.where(drawn, 235, 0).astype(np.uint8)
     buf = io.BytesIO()
     Image.fromarray(rgba, mode="RGBA").save(buf, format="PNG", optimize=True)
-    return buf.getvalue(), {"layer_code": layer_code, "width": width, "height": height,
-        "crs": "EPSG:4326", "bounds_wgs84": {"west": w, "south": s, "east": e, "north": n},
-        "resampling": "nearest", "drawn_pixels": int(drawn.sum()),
-        "config_value_min": cfg["value_min"], "config_value_max": cfg["value_max"]}
+    return buf.getvalue(), {
+        "layer_code": layer_code,
+        "width": width,
+        "height": height,
+        "crs": "EPSG:4326",
+        "bounds_wgs84": {"west": w, "south": s, "east": e, "north": n},
+        "resampling": "nearest",
+        "drawn_pixels": int(drawn.sum()),
+        "config_value_min": cfg["value_min"],
+        "config_value_max": cfg["value_max"],
+        "evidence_min": evidence_min,
+        "render_semantics": "spatial_evidence_only" if layer_code == "surface_water_trace" else "continuous_observed_signal",
+    }
 
 
 def _upload(tenant_id, land_id, date, scene_id, layer_code, png):
@@ -105,7 +127,8 @@ def build_water_layers(*, land, item, bands, masks, geom_wgs84, ref_transform, r
         v = values[finite].astype(float)
         rendered = _render(values, visible, geom_wgs84, ref_transform, ref_crs, code)
         path = _upload(land["tenant_id"], land["id"], acquisition_date, item.id, code, rendered[0]) if rendered else None
-        rec = {"tenant_id": land["tenant_id"], "land_id": land["id"], "scene_id": item.id,
+        rec = {
+            "tenant_id": land["tenant_id"], "land_id": land["id"], "scene_id": item.id,
             "acquisition_date": acquisition_date, "acquisition_time": acquisition_time,
             "layer_code": code, "value_mean": float(np.nanmean(v)), "value_median": float(np.nanmedian(v)),
             "value_p10": float(np.nanpercentile(v, 10)), "value_p90": float(np.nanpercentile(v, 90)),
@@ -114,12 +137,23 @@ def build_water_layers(*, land, item, bands, masks, geom_wgs84, ref_transform, r
             "effective_pixel_count": float(np.count_nonzero(finite)), "image_path": path,
             "image_metadata": rendered[1] if rendered else {"render_failed": True},
             "uncertainty_json": {"scope": "observed spatial support only", "model_confidence": None},
-            "evidence_json": {"surface_water_scl_fraction": masks.get("water_fraction"),
-                "cloud_fraction": masks.get("cloud_fraction"), "shadow_fraction": masks.get("shadow_fraction"),
-                "snow_fraction": masks.get("snow_fraction"), "effective_pixel_count": masks.get("epc_total"),
-                "observed_or_predicted": "observed"},
-            "provenance_json": {"source": "sentinel-2-l2a", "index": index, "bands": band_names,
-                "no_agronomic_threshold_applied": True}, "status": "observed"}
+            "evidence_json": {
+                "surface_water_scl_fraction": masks.get("water_fraction"),
+                "cloud_fraction": masks.get("cloud_fraction"),
+                "shadow_fraction": masks.get("shadow_fraction"),
+                "snow_fraction": masks.get("snow_fraction"),
+                "effective_pixel_count": masks.get("epc_total"),
+                "observed_or_predicted": "observed",
+                "spatial_evidence_cutoff": rendered[1].get("evidence_min") if rendered else None,
+                "spatial_evidence_pixels": rendered[1].get("drawn_pixels") if rendered else 0,
+            },
+            "provenance_json": {
+                "source": "sentinel-2-l2a", "index": index, "bands": band_names,
+                "no_agronomic_threshold_applied": True,
+                "spatial_render_is_evidence_mask": code == "surface_water_trace",
+            },
+            "status": "observed",
+        }
         with_retry(lambda r=rec: supabase.table("satellite_water_layers").upsert(
             r, on_conflict="tenant_id,land_id,scene_id,layer_code").execute(),
             what=f"upsert {code} {land['id']}/{item.id}", attempts=3)
