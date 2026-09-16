@@ -18,14 +18,26 @@ def process_land_water_layers(land: dict, scenes: Optional[list] = None, lookbac
         try:
             b04, ref_transform, ref_crs, coverage = read_band(item, "B04", geom_meas)
             ref = (b04.shape, ref_transform, ref_crs, coverage)
-            bands = {"B03": read_band(item, "B03", geom_meas, reference=ref)[0],
-                     "B08": read_band(item, "B08", geom_meas, reference=ref)[0],
-                     "B11": read_band(item, "B11", geom_meas, reference=ref)[0]}
+            bands = {
+                "B03": read_band(item, "B03", geom_meas, reference=ref)[0],
+                "B08": read_band(item, "B08", geom_meas, reference=ref)[0],
+                # B8A is a native 20 m band; read/resample it onto the B04
+                # reference grid before calculating NDMI so the output pixels
+                # have one common geolocation and cannot be shifted relative
+                # to the surface-water layer.
+                "B8A": read_band(item, "B8A", geom_meas, reference=ref)[0],
+                "B11": read_band(item, "B11", geom_meas, reference=ref)[0],
+            }
             scl = read_band(item, "SCL", geom_meas, reference=ref, categorical=True)[0]
             masks = scl_masks(scl, coverage=coverage)
-            records = build_water_layers(land=land, item=item, bands=bands, masks=masks,
-                                         geom_wgs84=geom, ref_transform=ref_transform, ref_crs=ref_crs)
+            records = build_water_layers(
+                land=land, item=item, bands=bands, masks=masks,
+                geom_wgs84=geom, ref_transform=ref_transform, ref_crs=ref_crs,
+            )
             count += len(records)
         except Exception as exc:
-            logger.warning(f"water layers failed land={land['id']} scene={getattr(item, 'id', '?')}: {type(exc).__name__}: {exc}")
+            logger.warning(
+                f"water layers failed land={land['id']} scene={getattr(item, 'id', '?')}: "
+                f"{type(exc).__name__}: {exc}"
+            )
     return count
