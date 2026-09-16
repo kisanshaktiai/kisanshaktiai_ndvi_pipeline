@@ -1,6 +1,19 @@
 name: NDVI Pipeline
 
 on:
+  push:
+    branches:
+      - feature/production-smallholder-intelligence
+    paths:
+      - 'water_layers.py'
+      - 'water_layer_runner.py'
+      - 'main.py'
+      - 'processor.py'
+      - 'raster_utils.py'
+      - 'sentinel_search.py'
+      - 'tile_grouping.py'
+      - 'config.py'
+      - '.github/workflows/ndvi-pipeline.yml'
   workflow_dispatch:
     inputs:
       backfill:
@@ -12,7 +25,7 @@ on:
         type: string
         default: ""
   schedule:
-    - cron: "0 2 * * *"     # daily at 02:00 UTC
+    - cron: "0 2 * * *"     # daily at 02:00 UTC on the default branch
 
 # Never run two pipelines at once: the lands snapshot is last-writer-wins.
 concurrency:
