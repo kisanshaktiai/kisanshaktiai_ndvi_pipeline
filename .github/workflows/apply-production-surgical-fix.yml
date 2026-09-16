@@ -1,0 +1,31 @@
+name: Apply Production Intelligence Surgical Fix
+
+on:
+  push:
+    branches:
+      - feature/production-smallholder-intelligence
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Apply fail-closed source transformations
+        run: python tools/apply_production_intelligence_surgical_fix.py
+      - name: Commit transformed pipeline
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git diff --quiet; then
+            echo "No source changes required."
+            exit 0
+          fi
+          git add indices.py processor.py
+          git commit -m "feat: wire production satellite intelligence primitives"
+          git push origin HEAD:feature/production-smallholder-intelligence
