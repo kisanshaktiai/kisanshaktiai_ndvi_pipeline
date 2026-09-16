@@ -75,7 +75,7 @@ def _supabase():
 
 # 10 m reference bands + the 20 m bands we resample onto them.
 S2_BANDS_10M = ["B02", "B03", "B04", "B08"]
-S2_BANDS_20M = ["B05", "B11"]
+S2_BANDS_20M = ["B05", "B8A", "B11"]
 
 INDEX_COLUMNS = (
     ("NDVI",  "ndvi"),  ("SAVI",  "savi"),  ("EVI",   "evi"),
@@ -324,9 +324,21 @@ def process_acquisition(item, geom_measured, buffer_applied: bool,
 
         row["processing_duration_ms"] = int((time.time() - _t0) * 1000)
 
+        # Calibration provenance is part of the measurement contract.
+        from production_intelligence import calibration_provenance
+        row.setdefault("metadata", {})
+        row["metadata"]["calibration"] = {
+            bk: calibration_provenance(item, bk)
+            for bk in ("B02", "B03", "B04", "B05", "B8A", "B08", "B11")
+            if bk in item.assets
+        }
+
         # ---- EVIDENCE BLOCK -------------------------------------------
         # Written to metadata ALWAYS (jsonb, no migration needed) and to
         # real columns only where they exist (db.py filters unknown keys).
+        from production_intelligence import spatial_effective_sample_size
+        spatial_support = spatial_effective_sample_size(idx.get("NDVI"), crop_w)
+
         evidence = {
             "spatial_stat_method": SPATIAL_STAT_METHOD,
             "effective_pixel_count": ndvi_stats["epc"],
@@ -338,7 +350,10 @@ def process_acquisition(item, geom_measured, buffer_applied: bool,
             "valid_weighted_fraction": qa.valid_fraction,
             "cloud_weighted_fraction": qa.cloud_fraction,
             "n_eff_kish": ndvi_stats["n_eff"],
-            "ndvi_spatial_se": ndvi_stats["se"],
+            "n_eff_spatial": spatial_support.get("n_eff_spatial"),
+            "spatial_se": spatial_support.get("spatial_se"),
+            "spatial_support_method": spatial_support.get("method"),
+            "ndvi_spatial_se": spatial_support.get("spatial_se") or ndvi_stats["se"],
             "ndvi_lower_95_spatial": _r(ndvi_stats["mean"] - 1.96 * (ndvi_stats["se"] or 0.0)),
             "ndvi_upper_95_spatial": _r(ndvi_stats["mean"] + 1.96 * (ndvi_stats["se"] or 0.0)),
             "uncertainty_scope": ("spatial sampling only; excludes sensor, "

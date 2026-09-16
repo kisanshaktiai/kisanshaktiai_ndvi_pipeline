@@ -17,7 +17,7 @@ Brain, from the values this module produces.
 
 Sentinel-2 band mapping (all ESA-documented centre wavelengths):
     B02 Blue 490nm | B03 Green 560nm | B04 Red 665nm
-    B05 RedEdge1 705nm | B08 NIR 842nm | B11 SWIR1 1610nm
+    B05 RedEdge1 705nm | B8A RedEdge4 865nm | B08 NIR 842nm | B11 SWIR1 1610nm
 
 INPUTS MUST BE SURFACE REFLECTANCE in [0,1]. raster_utils.to_reflectance()
 applies scale and BOA_ADD_OFFSET from STAC metadata rather than guessing from
@@ -61,7 +61,7 @@ INDEX_BANDS = {
     "NDVI":  ("B08", "B04"),
     "SAVI":  ("B08", "B04"),
     "EVI":   ("B08", "B04", "B02"),
-    "NDRE":  ("B08", "B05"),
+    "NDRE":  ("B8A", "B05"),
     "MCARI": ("B05", "B04", "B03"),
     "NDMI":  ("B08", "B11"),
     "NDWI":  ("B03", "B08"),
@@ -92,7 +92,7 @@ def compute_indices(b: dict) -> dict:
 
     Inputs
         b : dict of float32 surface-reflectance arrays on a common 10 m grid.
-            Keys B02 B03 B04 B05 B08 B11 (subset permitted).
+            Keys B02 B03 B04 B05 B8A B08 B11 (subset permitted).
 
     Outputs
         dict name -> float32 array, same shape, NaN outside valid pixels.
@@ -143,7 +143,7 @@ def compute_indices(b: dict) -> dict:
     if _available(b, "NDRE"):
         # Red edge stays sensitive after NDVI saturates; the better N proxy
         # post canopy closure.
-        out["NDRE"] = _nd(b["B08"], b["B05"])
+        out["NDRE"] = _nd(b["B8A"], b["B05"])
 
     if _available(b, "MCARI"):
         red_edge_red = b["B05"] - b["B04"]
