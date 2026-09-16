@@ -1,8 +1,9 @@
 """Observed water-related Sentinel-2 layers.
 
 Creates surface_water_trace (MNDWI + SCL water evidence) and
-canopy_moisture_signal (NDMI). No agronomic threshold or water-stress
-classification is performed here; presentation ramps come from DB config.
+canopy_moisture_signal (NDMI using the Sentinel-2 B8A/B11 moisture-index
+combination). No agronomic threshold or water-stress classification is
+performed here; presentation ramps come from DB config.
 """
 from __future__ import annotations
 import io
@@ -84,19 +85,19 @@ def _upload(tenant_id, land_id, date, scene_id, layer_code, png):
 
 
 def build_water_layers(*, land, item, bands, masks, geom_wgs84, ref_transform, ref_crs):
-    b03, b08, b11 = bands.get("B03"), bands.get("B08"), bands.get("B11")
-    if b03 is None or b08 is None or b11 is None:
+    b03, b08, b8a, b11 = bands.get("B03"), bands.get("B08"), bands.get("B8A"), bands.get("B11")
+    if b03 is None or b08 is None or b8a is None or b11 is None:
         return []
     visible = masks["in_field"] & ~masks["cloud"] & ~masks["shadow"] & ~masks["snow"]
     if not np.any(visible):
         return []
-    mndwi, ndmi = _ratio(b03, b11), _ratio(b08, b11)
+    mndwi, ndmi = _ratio(b03, b11), _ratio(b8a, b11)
     acquisition_date = item.datetime.date().isoformat()
     acquisition_time = item.datetime.isoformat() if item.datetime else None
     out = []
     for code, values, index, band_names in [
         ("surface_water_trace", mndwi, "MNDWI", ["B03", "B11"]),
-        ("canopy_moisture_signal", ndmi, "NDMI", ["B08", "B11"]),
+        ("canopy_moisture_signal", ndmi, "NDMI", ["B8A", "B11"]),
     ]:
         finite = visible & np.isfinite(values)
         if not np.any(finite):
