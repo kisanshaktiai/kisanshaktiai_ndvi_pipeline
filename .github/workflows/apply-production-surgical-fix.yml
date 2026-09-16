@@ -26,6 +26,6 @@ jobs:
             echo "No source changes required."
             exit 0
           fi
-          git add indices.py processor.py supabase/functions/proactive-evaluator/index.ts
+          git add indices.py processor.py
           git commit -m "feat: wire production satellite intelligence primitives"
           git push origin HEAD:feature/production-smallholder-intelligence
