@@ -3,6 +3,7 @@ name: NDVI Pipeline
 on:
   push:
     branches:
+      - main
       - feature/production-smallholder-intelligence
     paths:
       - 'water_layers.py'
@@ -13,6 +14,10 @@ on:
       - 'sentinel_search.py'
       - 'tile_grouping.py'
       - 'config.py'
+      - 'context_enrichment.py'
+      - 'parcel_context.py'
+      - 'ndvi_intelligence_writer.py'
+      - 'intelligence_runner.py'
       - '.github/workflows/ndvi-pipeline.yml'
   workflow_dispatch:
     inputs:
@@ -25,9 +30,8 @@ on:
         type: string
         default: ""
   schedule:
-    - cron: "0 2 * * *"     # daily at 02:00 UTC on the default branch
+    - cron: "0 2 * * *"
 
-# Never run two pipelines at once: the lands snapshot is last-writer-wins.
 concurrency:
   group: ndvi-pipeline
   cancel-in-progress: false
@@ -57,7 +61,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run NDVI pipeline
+      - name: Run NDVI measurement pipeline
         run: |
           ARGS=""
           if [ "${{ github.event.inputs.backfill }}" = "true" ]; then ARGS="$ARGS --backfill"; fi
@@ -65,10 +69,19 @@ jobs:
           python main.py $ARGS 2>&1 | tee pipeline.log
           exit ${PIPESTATUS[0]}
 
-      - name: Upload run log
+      - name: Persist governed observed NDVI intelligence
+        run: |
+          ARGS=""
+          if [ -n "${{ github.event.inputs.tenant }}" ]; then ARGS="$ARGS --tenant ${{ github.event.inputs.tenant }}"; fi
+          python intelligence_runner.py $ARGS 2>&1 | tee intelligence.log
+          exit ${PIPESTATUS[0]}
+
+      - name: Upload run logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: ndvi-pipeline-log-${{ github.run_id }}
-          path: pipeline.log
+          path: |
+            pipeline.log
+            intelligence.log
           retention-days: 30
