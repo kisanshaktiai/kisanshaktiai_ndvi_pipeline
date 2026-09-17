@@ -9,3 +9,4 @@ supabase
 pyproj
 matplotlib
 pillow
+pytest
