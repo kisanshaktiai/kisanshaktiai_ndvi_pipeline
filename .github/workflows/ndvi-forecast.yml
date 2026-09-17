@@ -1,0 +1,50 @@
+name: NDVI Temporal Forecast
+
+on:
+  workflow_dispatch:
+    inputs:
+      tenant:
+        description: "Restrict to one tenant_id (optional)"
+        type: string
+        default: ""
+  schedule:
+    - cron: "30 2 * * *"
+
+concurrency:
+  group: ndvi-temporal-forecast
+  cancel-in-progress: false
+
+jobs:
+  forecast:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+      PYTHONUNBUFFERED: "1"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Run temporal forecast
+        run: |
+          if [ -n "${{ github.event.inputs.tenant }}" ]; then
+            python ndvi_temporal_predictor.py --tenant "${{ github.event.inputs.tenant }}" | tee forecast.log
+          else
+            python ndvi_temporal_predictor.py | tee forecast.log
+          fi
+      - name: Upload forecast log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ndvi-temporal-forecast-${{ github.run_id }}
+          path: forecast.log
+          retention-days: 30
