@@ -49,7 +49,7 @@ from indices import (compute_indices, validate_index, index_statistics,
                      weighted_index_statistics, weighted_histogram)
 from sar_vegetation import rvi_from_gamma0
 from quality import assess, evidence_tier
-from raster_io import render_ndvi_png, storage_path, upload_png, render_truecolor_png, thumbnail_path
+from raster_io import render_ndvi_png, storage_path, upload_png, render_zone_png, zone_path, render_truecolor_png, thumbnail_path
 from zone_stats import compute_zones
 from config import (
     FIELD_BUFFER_M, NDVI_DECIMALS, ENABLE_S1_FALLBACK, NDVI_HISTOGRAM_BINS,
@@ -170,7 +170,8 @@ def process_acquisition(item, geom_measured, buffer_applied: bool,
                         reject_sink: Optional[list] = None,
                         error_sink: Optional[list] = None,
                         measured_area_m2: float = None,
-                        geom_wgs84=None) -> Optional[dict]:
+                        geom_wgs84=None,
+                        history: Optional[List[dict]] = None) -> Optional[dict]:
     """
     Process ONE Sentinel-2 acquisition over ONE field.
     Returns a complete row dict, or None if the acquisition is rejected.
@@ -402,22 +403,26 @@ def process_acquisition(item, geom_measured, buffer_applied: bool,
                         image_meta["bucket"] = NDVI_IMAGE_BUCKET
                     else:
                         image_meta["upload_failed"] = True
+                # three-colour zone map (field median +/- noise floor) — the farmer's default view
+                zr = render_zone_png(idx.get("NDVI"), crop_w, ref_transform, ref_crs, geom_wgs84,
+                                     ndvi_stats.get("median") if ndvi_stats else None)
+                if zr and image_meta is not None:
+                    zpath = zone_path(land["tenant_id"], land["id"], meta["acquisition_date"], meta["scene_id"])
+                    if upload_png(_supabase(), zpath, zr[0]):
+                        image_meta["zones"] = {**zr[1], "storage_path": zpath}
             except Exception as e:
                 logger.warning(f"NDVI image step failed for land {land['id']} "
                                f"scene {meta['scene_id']}: {type(e).__name__}: {e}")
                 image_meta = {"error": f"{type(e).__name__}: {str(e)[:200]}"}
 
-        # ---- WHERE TO CHECK (quarter statistics) ---------------------------------
-        # Same arrays and weights as the statistics above; previous pass's zones
-        # come from history so persistence is judged on two real passes.
+        # ---- WHERE TO CHECK (quarter statistics; growth and moisture) ----------------
         try:
             prev_zones = None
             for h in (history or []):
                 if h.get("acquisition_date") and h["acquisition_date"] < meta["acquisition_date"]:
-                    mz = (h.get("metadata") or {}).get("zones") if isinstance(h.get("metadata"), dict) else None
-                    if mz:
-                        prev_zones = mz
-                        break
+                    md = h.get("metadata") if isinstance(h.get("metadata"), dict) else {}
+                    if md.get("zones"):
+                        prev_zones = md["zones"]; break
             zones = compute_zones(idx, crop_w, masks["coverage"], masks["crop"],
                                   ndvi_stats.get("median") if ndvi_stats else None,
                                   evidence.get("ndvi_spatial_se"), qa.evidence_confidence, prev_zones)
@@ -425,10 +430,7 @@ def process_acquisition(item, geom_measured, buffer_applied: bool,
             logger.warning(f"zone stats failed for land {land['id']} scene {meta['scene_id']}: {type(e).__name__}: {e}")
             zones = {"level": "none", "reason": f"error:{type(e).__name__}"}
 
-        # ---- ONE-TIME LAND THUMBNAIL ---------------------------------------------
-        # Only while the land has no thumbnail, only on a clean pass (<= 10 % cloud),
-        # from the bands already read. Once written, never again - a land's outline
-        # does not change. main.py copies the path into lands.ndvi_thumbnail_url.
+        # ---- ONE-TIME LAND THUMBNAIL (only while the land has none, clean pass) -------
         if ENABLE_NDVI_IMAGES and geom_wgs84 is not None and land.get("_thumbnail_pending") and (qa.cloud_fraction or 0) <= 0.10:
             try:
                 tc = render_truecolor_png(with_ref.get("B02"), with_ref.get("B03"), with_ref.get("B04"),
@@ -436,9 +438,7 @@ def process_acquisition(item, geom_measured, buffer_applied: bool,
                 if tc:
                     tpath = thumbnail_path(land["tenant_id"], land["id"], meta["acquisition_date"])
                     if upload_png(_supabase(), tpath, tc[0]):
-                        land["_thumbnail_path"] = tpath
-                        land["_thumbnail_pending"] = False
-                        logger.info(f"land {land['id'][:8]}: one-time true-colour thumbnail written ({tc[1]['width']}x{tc[1]['height']})")
+                        land["_thumbnail_path"] = tpath; land["_thumbnail_pending"] = False
             except Exception as e:
                 logger.warning(f"thumbnail step failed for land {land['id']}: {type(e).__name__}: {e}")
 
@@ -545,7 +545,8 @@ def process_land(land: dict, lookback_days: int = None,
                                 reject_sink=report["optical_rejects"],
                                 error_sink=report["scene_errors"],
                                 measured_area_m2=measured_area_m2,
-                                geom_wgs84=geom_meas)
+                                geom_wgs84=geom_meas,
+                                history=history)
         if r:
             r["field_area_m2"] = round(raw_area_m2, 1)
             rows.append(r)

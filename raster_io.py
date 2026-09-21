@@ -236,59 +236,104 @@ def upload_png(client, path: str, data: bytes) -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
+# ZONE MAP (three colours, like a vegetation-zone map)                      v3.3
+# ---------------------------------------------------------------------------
+# Farmers read three colours faster than a gradient. Each 10 m cell is classed
+# against THIS FIELD's own coverage-weighted median NDVI, with a noise floor:
+#   lower  : cell < median - ZONE_CLASS_DELTA
+#   normal : within +/- ZONE_CLASS_DELTA of the median
+#   higher : cell > median + ZONE_CLASS_DELTA
+# Deliberately NOT terciles: splitting every field into thirds paints a "red
+# zone" on a perfectly uniform healthy field. With a noise floor a uniform
+# field shows one colour, and red appears only where the crop really differs.
+# ZONE_CLASS_DELTA is an engineering display rule, not a validated threshold.
+ZONE_CLASS_DELTA = 0.05
+ZONE_COLOURS = {1: (192, 57, 43), 2: (244, 208, 63), 3: (39, 174, 96)}   # lower / normal / higher
+
+
+def render_zone_png(ndvi, visible, src_transform, src_crs, geom_wgs84, field_median):
+    """Three-class zone map of the field, warped north-up to its WGS84 bbox. (png, meta) or None."""
+    if ndvi is None or field_median is None:
+        return None
+    vis = np.asarray(visible, dtype="float32") > 0
+    src = np.where(vis & np.isfinite(ndvi), ndvi, np.nan).astype("float32")
+    cls = np.full(src.shape, np.nan, dtype="float32")
+    cls[np.isfinite(src)] = 2.0
+    cls[src < field_median - ZONE_CLASS_DELTA] = 1.0
+    cls[src > field_median + ZONE_CLASS_DELTA] = 3.0
+    if not np.isfinite(cls).any():
+        return None
+    w, s, e, n = geom_wgs84.bounds
+    width, height = _output_shape((w, s, e, n), (s + n) / 2.0)
+    dst_transform = from_bounds(w, s, e, n, width, height)
+    dst = np.full((height, width), np.nan, dtype="float32")
+    reproject(source=cls, destination=dst, src_transform=src_transform, src_crs=src_crs,
+              dst_transform=dst_transform, dst_crs="EPSG:4326", src_nodata=np.nan, dst_nodata=np.nan,
+              resampling=Resampling.nearest)
+    rgba = np.zeros((height, width, 4), dtype=np.uint8)
+    for k, rgb in ZONE_COLOURS.items():
+        m = dst == k
+        rgba[m, 0], rgba[m, 1], rgba[m, 2], rgba[m, 3] = rgb[0], rgb[1], rgb[2], 235
+    total = int(np.isfinite(dst).sum())
+    shares = {name: (round(float((dst == k).sum()) / total, 3) if total else 0.0) for k, name in ((1, "lower"), (2, "normal"), (3, "higher"))}
+    buf = io.BytesIO()
+    Image.fromarray(rgba, mode="RGBA").save(buf, format="PNG", optimize=True)
+    return buf.getvalue(), {"width": width, "height": height, "crs": "EPSG:4326",
+                            "bounds_wgs84": {"west": w, "south": s, "east": e, "north": n},
+                            "kind": "zone_classes", "classes": ["lower", "normal", "higher"],
+                            "class_rule": f"field median +/- {ZONE_CLASS_DELTA} NDVI (display rule, not validated)",
+                            "shares": shares, "field_median": round(float(field_median), 4)}
+
+
+def zone_path(tenant_id: str, land_id: str, acquisition_date: str, scene_id: str) -> str:
+    safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in (scene_id or "noscene"))
+    return f"{tenant_id}/{land_id}/{acquisition_date}_{safe}_zones.png"
+
+
+# ---------------------------------------------------------------------------
 # ONE-TIME LAND THUMBNAIL (true colour, Sentinel-2 B04/B03/B02)              v3.3
 # ---------------------------------------------------------------------------
-# Why: the farmer app requested a Google Static Map for every land card on
-# every render - a billable event each time, and Google's terms allow only
-# temporary caching (<= 30 days), never permanent storage. A land's outline
-# does not change, so the thumbnail should be made ONCE, from imagery we own.
-# This renders the field and a margin of context in natural colour from the
-# same bands the pipeline already reads, on the first clear pass, and the
-# path is written to lands.ndvi_thumbnail_url. Zero recurring cost.
-
-THUMB_CONTEXT_MARGIN = 0.35   # fraction of the field bbox added on each side for context
+# Google's terms allow Static Map images to be cached only temporarily, so a
+# permanent land thumbnail must come from imagery we own. Rendered ONCE per
+# land on the first clean pass; lands.ndvi_thumbnail_url keeps the path.
+THUMB_CONTEXT_MARGIN = 0.35
 THUMB_MAX_PX = 360
 
 
-def render_truecolor_png(b02, b03, b04, coverage: np.ndarray, src_transform, src_crs, geom_wgs84):
-    """True-colour thumbnail of the field with dimmed surroundings. Returns (png, meta) or None."""
+def render_truecolor_png(b02, b03, b04, coverage, src_transform, src_crs, geom_wgs84):
     if b02 is None or b03 is None or b04 is None:
         return None
-    rgb_src = np.stack([b04, b03, b02]).astype("float32")          # R, G, B
+    rgb_src = np.stack([b04, b03, b02]).astype("float32")
     finite = np.isfinite(rgb_src).all(axis=0)
     if not finite.any():
         return None
-    # per-band 2-98 percentile stretch over the window - the usual natural-colour stretch
     out = np.zeros_like(rgb_src)
     for i in range(3):
-        band = rgb_src[i]
-        lo, hi = np.nanpercentile(band[finite], [2, 98])
-        out[i] = np.clip((band - lo) / max(hi - lo, 1e-6), 0, 1)
+        lo, hi = np.nanpercentile(rgb_src[i][finite], [2, 98])
+        out[i] = np.clip((rgb_src[i] - lo) / max(hi - lo, 1e-6), 0, 1)
     w, s, e, n = geom_wgs84.bounds
     mw, mh = (e - w) * THUMB_CONTEXT_MARGIN, (n - s) * THUMB_CONTEXT_MARGIN
     W, S, E, N = w - mw, s - mh, e + mw, n + mh
     width, height = _output_shape((W, S, E, N), (S + N) / 2.0)
-    width = min(width, THUMB_MAX_PX); height = min(height, THUMB_MAX_PX)
+    width, height = min(width, THUMB_MAX_PX), min(height, THUMB_MAX_PX)
     dst_transform = from_bounds(W, S, E, N, width, height)
     dst = np.full((3, height, width), np.nan, dtype="float32")
-    alpha_src = np.where(coverage > 0, 1.0, 0.55).astype("float32")   # field bright, context dimmed
-    dst_alpha = np.full((height, width), np.nan, dtype="float32")
     for i in range(3):
         reproject(source=np.where(finite, out[i], np.nan), destination=dst[i], src_transform=src_transform, src_crs=src_crs,
                   dst_transform=dst_transform, dst_crs="EPSG:4326", src_nodata=np.nan, dst_nodata=np.nan, resampling=Resampling.bilinear)
-    reproject(source=alpha_src, destination=dst_alpha, src_transform=src_transform, src_crs=src_crs,
+    alpha = np.full((height, width), np.nan, dtype="float32")
+    reproject(source=np.where(coverage > 0, 1.0, 0.55).astype("float32"), destination=alpha, src_transform=src_transform, src_crs=src_crs,
               dst_transform=dst_transform, dst_crs="EPSG:4326", src_nodata=np.nan, dst_nodata=np.nan, resampling=Resampling.nearest)
     drawn = np.isfinite(dst).all(axis=0)
     if drawn.mean() < 0.5:
-        return None                                                   # window mostly outside the read - skip, try next pass
+        return None
     rgba = np.zeros((height, width, 4), dtype=np.uint8)
     rgba[..., :3] = (np.nan_to_num(dst, nan=0.0).transpose(1, 2, 0) * 255).astype(np.uint8)
-    rgba[..., 3] = np.where(drawn, (np.nan_to_num(dst_alpha, nan=0.55) * 255), 0).astype(np.uint8)
+    rgba[..., 3] = np.where(drawn, np.nan_to_num(alpha, nan=0.55) * 255, 0).astype(np.uint8)
     buf = io.BytesIO()
     Image.fromarray(rgba, mode="RGBA").save(buf, format="PNG", optimize=True)
-    return buf.getvalue(), {"width": width, "height": height, "crs": "EPSG:4326",
-                            "bounds_wgs84": {"west": W, "south": S, "east": E, "north": N},
-                            "kind": "truecolor_thumbnail", "bands": "B04/B03/B02", "stretch": "p2-p98"}
+    return buf.getvalue(), {"width": width, "height": height, "kind": "truecolor_thumbnail",
+                            "bounds_wgs84": {"west": W, "south": S, "east": E, "north": N}}
 
 
 def thumbnail_path(tenant_id: str, land_id: str, acquisition_date: str) -> str:

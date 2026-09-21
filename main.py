@@ -113,7 +113,6 @@ def handle_land(land: dict, lookback: int, run_started: datetime, scenes=None) -
                 land_id=land_id, ndvi_value=newest_opt["ndvi_value"],
                 acquisition_date=newest_opt["acquisition_date"],
                 quality_score=newest_opt.get("quality_score"), source="sentinel-2",
-                # one-time true-colour thumbnail path (processor sets it only when the land had none)
                 thumbnail_url=land.get("_thumbnail_path"),
             )
             trend = classify_trend([
