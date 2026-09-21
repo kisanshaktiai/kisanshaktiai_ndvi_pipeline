@@ -106,10 +106,16 @@ def iter_lands(tenant_id: Optional[str] = None) -> Iterator[Dict]:
 
     while True:
         q = (supabase.table("lands")
+             # boundary_geom is the PostGIS column and is populated on 29 of
+             # 29 active lands, but was never selected - so every observation
+             # in the 2026-08-07 run carried geometry_confidence='medium',
+             # silently falling back to the legacy jsonb. PostgREST returns
+             # geometry as GeoJSON, which shapely.shape() consumes directly.
              .select("id, tenant_id, area_acres, area_guntas, current_crop, "
-                     "current_crop_id, boundary_polygon_old, mgrs_tile_id, "
-                     "tile_id, center_lat, center_lon, crop_cycle, "
-                     "transplant_date, planting_date, last_sowing_date, das")
+                     "current_crop_id, boundary_geom, boundary_polygon_old, "
+                     "mgrs_tile_id, tile_id, center_lat, center_lon, "
+                     "crop_cycle, transplant_date, planting_date, "
+                     "last_sowing_date, das, ndvi_thumbnail_url")
              .eq("is_active", True)
              .is_("deleted_at", None)
              .order("id")
@@ -150,31 +156,120 @@ def count_eligible_lands(tenant_id: Optional[str] = None) -> int:
 # ---------------------------------------------------------------------------
 # NDVI WRITE - idempotent on TRUE acquisition identity
 # ---------------------------------------------------------------------------
-def upsert_observations(rows: List[Dict]) -> int:
+_KNOWN_COLUMNS = None          # cache; None = not probed yet
+_DROPPED_REPORTED = set()
+
+
+def known_columns() -> Optional[set]:
     """
-    Conflict target is (land_id, scene_id), not (land_id, date).
+    Columns that actually exist on public.ndvi_data, probed once from a real
+    row. Returns None if the probe fails or the table is empty (then nothing
+    is filtered).
 
-    v1 used (land_id, date) where date was the pipeline RUN date, so every
-    daily run minted a new key for the same underlying scene - producing
-    96.4% consecutive-day spacing and 72.2% exact repeated values from a
-    satellite that revisits every ~3 days.
+    WHY THIS EXISTS. v3 writes evidence fields (effective_pixel_count,
+    coverage_weighted_purity, ...) that do not exist until the accompanying
+    migration is applied. PostgREST rejects the WHOLE batch on an unknown
+    column, so without this probe deploying the code before the migration
+    would fail every land, every night. Everything filtered out here is
+    still persisted inside metadata.evidence, so no evidence is lost - only
+    its promotion to a first-class column waits for the migration.
+    """
+    global _KNOWN_COLUMNS
+    if _KNOWN_COLUMNS is not None:
+        return _KNOWN_COLUMNS or None
+    try:
+        res = supabase.table("ndvi_data").select("*").limit(1).execute()
+        if res.data:
+            _KNOWN_COLUMNS = set(res.data[0].keys())
+            logger.info(f"ndvi_data schema probe: {len(_KNOWN_COLUMNS)} columns")
+        else:
+            _KNOWN_COLUMNS = set()
+    except Exception as e:
+        logger.warning(f"schema probe failed ({e}); writing rows unfiltered")
+        _KNOWN_COLUMNS = set()
+    return _KNOWN_COLUMNS or None
 
-    Keying on scene_id makes re-runs and backfills genuinely idempotent:
-    the same acquisition can never be stored twice under different dates.
+
+def _filter_to_schema(rows: List[Dict]) -> List[Dict]:
+    cols = known_columns()
+    if not cols:
+        return rows
+    out = []
+    for r in rows:
+        extra = set(r) - cols
+        if extra:
+            for k in sorted(extra):
+                if k not in _DROPPED_REPORTED:
+                    _DROPPED_REPORTED.add(k)
+                    logger.warning(
+                        f"column '{k}' absent from ndvi_data - kept in "
+                        f"metadata.evidence only. Apply the v3 migration to "
+                        f"promote it to a column.")
+            r = {k: v for k, v in r.items() if k in cols}
+        out.append(r)
+    return out
+
+
+def upsert_observations(rows: List[Dict], run_started_at: datetime = None):
+    """
+    Conflict target is (land_id, scene_id). Returns (upserted, newly_inserted).
+
+    v2.1 returned len(rows) and main.py reported it as "observations
+    written": on 2026-08-29 the run reported 30 written while 0 rows were
+    created (F-6). newly_inserted is measured from created_at >= run start,
+    so the run summary and the exit-code guard see REAL new data.
     """
     if not rows:
-        return 0
+        return 0, 0
+    land_id = rows[0].get("land_id")
+    rows = _filter_to_schema(rows)
     try:
         with_retry(
             lambda: supabase.table("ndvi_data")
                     .upsert(rows, on_conflict="land_id,scene_id").execute(),
-            what=f"upsert {len(rows)} observation(s) for land {rows[0].get('land_id')}",
+            what=f"upsert {len(rows)} observation(s) for land {land_id}",
         )
-        return len(rows)
     except Exception:
-        logger.exception(f"upsert failed for {len(rows)} rows "
-                         f"(land {rows[0].get('land_id')})")
+        logger.exception(f"upsert failed for {len(rows)} rows (land {land_id})")
         raise
+
+    new = 0
+    if run_started_at is not None:
+        try:
+            scene_ids = [r["scene_id"] for r in rows if r.get("scene_id")]
+            res = with_retry(
+                lambda: supabase.table("ndvi_data").select("id", count="exact")
+                   .eq("land_id", land_id).in_("scene_id", scene_ids)
+                   .gte("created_at", run_started_at.isoformat())
+                   .limit(1).execute(),
+                what=f"new-row count {land_id}", attempts=3)
+            new = int(res.count or 0)
+        except Exception as e:
+            logger.warning(f"new-row count failed for {land_id}: {e}")
+            new = -1   # unknown; caller treats as "could not verify"
+    return len(rows), new
+
+
+def optical_history(land_id: str, days: int) -> List[Dict]:
+    """Stored optical observations in the last `days` (for temporal checks)."""
+    from datetime import date, timedelta
+    since = (date.today() - timedelta(days=days)).isoformat()
+    try:
+        res = with_retry(
+            lambda: supabase.table("ndvi_data")
+                .select("acquisition_date, ndvi_value, scene_id, metadata")
+                .eq("land_id", land_id)
+                .eq("observation_source", "sentinel-2")
+                .eq("observation_type", "observed")
+                .not_.is_("ndvi_value", "null")
+                .gte("acquisition_date", since)
+                .order("acquisition_date", desc=True)
+                .limit(30).execute(),
+            what=f"optical_history {land_id}", attempts=3)
+        return res.data or []
+    except Exception as e:
+        logger.warning(f"optical_history failed for {land_id}: {type(e).__name__}: {e}")
+        return []
 
 
 def latest_observation(land_id: str) -> Optional[Dict]:
@@ -204,6 +299,12 @@ def update_land_snapshot(*, land_id: str, ndvi_value, acquisition_date,
     that disagreed with ndvi_data, with value divergence up to 0.360.
     v2 writes the TRUE acquisition date and the quality that produced it.
     """
+    if ndvi_value is None:
+        # F-3: the radar path used to write last_ndvi_value = NULL over a
+        # valid optical cache. The cache is OPTICAL ONLY; radar-only runs
+        # must go through mark_land_status() instead.
+        raise ValueError("update_land_snapshot requires an optical ndvi_value; "
+                         "use mark_land_status for radar-only runs")
     data = {
         "last_ndvi_value": ndvi_value,
         "last_ndvi_calculation": acquisition_date,   # TRUE acquisition date
@@ -285,6 +386,7 @@ def write_run_summary(summary: Dict) -> None:
     scheduler goes red on a silent failure.
     """
     try:
-        supabase.table("ndvi_run_summary").insert(summary).execute()
+        with_retry(lambda: supabase.table("ndvi_run_summary").insert(summary).execute(),
+                   what="run summary insert", attempts=2)
     except Exception as e:
         logger.warning(f"run summary insert failed (table may not exist yet): {e}")
