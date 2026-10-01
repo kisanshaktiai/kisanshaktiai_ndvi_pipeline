@@ -7,8 +7,13 @@ on:
         description: "Restrict to one tenant_id (optional)"
         type: string
         default: ""
-  schedule:
-    - cron: "30 2 * * *"
+  # Run AFTER the NDVI pipeline finishes, not at a fixed clock time. A fixed
+  # 02:30 start assumed the 02:00 pipeline was done, but GitHub starts
+  # scheduled runs late (the 2026-09-23 pipeline started at 02:55), so the
+  # forecast could run BEFORE that night's observations existed.
+  workflow_run:
+    workflows: ["NDVI Pipeline"]
+    types: [completed]
 
 concurrency:
   group: ndvi-temporal-forecast
@@ -16,6 +21,8 @@ concurrency:
 
 jobs:
   forecast:
+    # after the pipeline only if it succeeded; manual runs always
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
@@ -35,7 +42,10 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
       - name: Run temporal forecast
+        # pipefail: without it the step's exit code is tee's (always 0), so a
+        # crashing forecast was reported as success.
         run: |
+          set -o pipefail
           if [ -n "${{ github.event.inputs.tenant }}" ]; then
             python ndvi_temporal_predictor.py --tenant "${{ github.event.inputs.tenant }}" | tee forecast.log
           else

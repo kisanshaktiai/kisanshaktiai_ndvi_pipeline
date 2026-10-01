@@ -13,6 +13,10 @@ on:
       - 'raster_utils.py'
       - 'sentinel_search.py'
       - 'tile_grouping.py'
+      - 'tile_reader.py'
+      - 'resource_budget.py'
+      - 'db.py'
+      - 'raster_io.py'
       - 'config.py'
       - 'context_enrichment.py'
       - 'parcel_context.py'
@@ -30,7 +34,10 @@ on:
         type: string
         default: ""
   schedule:
-    - cron: "0 2 * * *"
+    # 02:07 UTC = 07:37 IST. Off the top of the hour: GitHub documents that
+    # scheduled runs at :00 are the most likely to be delayed or dropped under
+    # load. The forecast is chained to this run (ndvi-forecast.yml).
+    - cron: "7 2 * * *"
 
 concurrency:
   group: ndvi-pipeline
@@ -39,7 +46,9 @@ concurrency:
 jobs:
   run-ndvi:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    # 90 min was the binding limit at ~400 lands: the job is killed mid-run and
+    # the night's observations are lost. GitHub's hard ceiling is 360 min.
+    timeout-minutes: 330
 
     env:
       SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
