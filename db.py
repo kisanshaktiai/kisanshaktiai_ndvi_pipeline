@@ -19,6 +19,7 @@ import os
 from typing import List, Dict, Optional, Iterator
 from datetime import datetime, timezone
 
+import threading
 from supabase import create_client, Client
 from dotenv import load_dotenv
 
@@ -33,11 +34,37 @@ SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 if not SUPABASE_URL or not SUPABASE_KEY:
     raise RuntimeError("SUPABASE_URL and SUPABASE_KEY must be set")
 
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+class _ThreadLocalClient:
+    """One Supabase client PER THREAD behind the usual `supabase` name.
+
+    A single client was shared by every worker thread, so all of them
+    multiplexed one HTTP/2 connection. The 2026-09-23 run logged ~40
+    `RemoteProtocolError: Server disconnected` resets under 4 workers; database
+    writes survived on retry, but two NDVI image uploads were lost. Each thread
+    now gets its own client (and connection). Every existing call site -
+    `supabase.table(...)`, `supabase.storage...` - works unchanged, because
+    attribute access is forwarded to the calling thread's client."""
+
+    def __init__(self, url: str, key: str):
+        self._url, self._key = url, key
+        self._local = threading.local()
+
+    def _client(self) -> Client:
+        c = getattr(self._local, "client", None)
+        if c is None:
+            c = create_client(self._url, self._key)
+            self._local.client = c
+        return c
+
+    def __getattr__(self, name):
+        return getattr(self._client(), name)
+
+
+supabase = _ThreadLocalClient(SUPABASE_URL, SUPABASE_KEY)
 
 
 def get_supabase_client() -> Client:
-    return supabase
+    return supabase._client()
 
 
 # ---------------------------------------------------------------------------
@@ -115,7 +142,7 @@ def iter_lands(tenant_id: Optional[str] = None) -> Iterator[Dict]:
                      "current_crop_id, boundary_geom, boundary_polygon_old, "
                      "mgrs_tile_id, tile_id, center_lat, center_lon, "
                      "crop_cycle, transplant_date, planting_date, "
-                     "last_sowing_date, das")
+                     "last_sowing_date, das, ndvi_thumbnail_url")
              .eq("is_active", True)
              .is_("deleted_at", None)
              .order("id")
@@ -257,7 +284,7 @@ def optical_history(land_id: str, days: int) -> List[Dict]:
     try:
         res = with_retry(
             lambda: supabase.table("ndvi_data")
-                .select("acquisition_date, ndvi_value, scene_id")
+                .select("acquisition_date, ndvi_value, scene_id, metadata")
                 .eq("land_id", land_id)
                 .eq("observation_source", "sentinel-2")
                 .eq("observation_type", "observed")
@@ -390,3 +417,318 @@ def write_run_summary(summary: Dict) -> None:
                    what="run summary insert", attempts=2)
     except Exception as e:
         logger.warning(f"run summary insert failed (table may not exist yet): {e}")
+
+# ---------------------------------------------------------------------------
+# SCENE EVALUATION LEDGER (sql/2026-09-23_ndvi_scene_evaluations.sql)
+# ---------------------------------------------------------------------------
+# Lets the nightly run skip (land, scene) pairs it has already measured. The
+# pipeline must behave EXACTLY as before when the table does not exist yet, so
+# every function here degrades to "nothing is known" on any error.
+_LEDGER_AVAILABLE = True
+_LEDGER_CHUNK = 100          # land ids per request: keeps the URL well short
+
+
+def fetch_scene_ledger(land_ids: List[str], pipeline_version: str,
+                       since_iso: str) -> Optional[Dict[str, Dict[str, list]]]:
+    """{land_id: {scene_id: [(geometry_fingerprint, outcome), ...]}} or None.
+
+    One request per 100 lands - a whole read-block in one or two calls, never
+    one call per land. None means "ledger unavailable": callers then evaluate
+    every scene, which is the pre-ledger behaviour.
+    """
+    global _LEDGER_AVAILABLE
+    if not _LEDGER_AVAILABLE or not land_ids:
+        return None
+    out: Dict[str, Dict[str, list]] = {}
+    try:
+        for i in range(0, len(land_ids), _LEDGER_CHUNK):
+            chunk = land_ids[i:i + _LEDGER_CHUNK]
+            res = with_retry(
+                lambda: supabase.table("ndvi_scene_evaluations")
+                    .select("land_id, scene_id, geometry_fingerprint, outcome")
+                    .in_("land_id", chunk)
+                    .eq("pipeline_version", pipeline_version)
+                    .gte("acquisition_date", since_iso)
+                    .limit(10000).execute(),
+                what=f"scene ledger for {len(chunk)} land(s)", attempts=3)
+            for r in res.data or []:
+                out.setdefault(r["land_id"], {}).setdefault(r["scene_id"], []).append(
+                    (r["geometry_fingerprint"], r["outcome"]))
+        return out
+    except Exception as e:
+        text = f"{type(e).__name__}: {e}"
+        if "ndvi_scene_evaluations" in text or "42P01" in text or "PGRST205" in text:
+            _LEDGER_AVAILABLE = False
+            logger.warning("scene ledger table not present - evaluating every scene "
+                           "(apply sql/2026-09-23_ndvi_scene_evaluations.sql to enable skipping)")
+        else:
+            logger.warning(f"scene ledger read failed ({text}) - evaluating every scene this block")
+        return None
+
+
+def record_scene_evaluations(rows: List[Dict]) -> int:
+    """Batched upsert of deterministic outcomes. Never raises."""
+    if not _LEDGER_AVAILABLE or not rows:
+        return 0
+    try:
+        with_retry(
+            lambda: supabase.table("ndvi_scene_evaluations")
+                .upsert(rows, on_conflict="land_id,scene_id,pipeline_version,geometry_fingerprint")
+                .execute(),
+            what=f"record {len(rows)} scene evaluation(s)", attempts=3)
+        return len(rows)
+    except Exception as e:
+        logger.warning(f"scene ledger write failed for {len(rows)} row(s): {type(e).__name__}: {e} "
+                       "- those scenes will simply be re-evaluated next run")
+        return 0
+
+
+# ---------------------------------------------------------------------------
+# BATCHED WRITES (one request per chunk of a read-block, not per land)
+# ---------------------------------------------------------------------------
+# Every function keeps per-land ISOLATION: if a batch fails, it is retried
+# land by land so one bad row cannot fail its neighbours, and the caller learns
+# exactly which lands did and did not persist.
+_BATCH_ROWS = 500
+
+
+def build_log_payload(*, processing_step: str, step_status: str, tenant_id: str = None,
+                      land_id: str = None, started_at: datetime = None,
+                      error_message: str = None, metadata: Dict = None) -> Dict:
+    """The exact row log_step would insert, without inserting it."""
+    now = datetime.now(timezone.utc)
+    payload = {
+        "processing_step": processing_step,
+        "step_status": step_status,
+        "tenant_id": tenant_id,
+        "land_id": land_id,
+        "started_at": (started_at or now).isoformat(),
+        "completed_at": now.isoformat() if step_status in ("completed", "failed", "skipped") else None,
+        "duration_ms": int((now - started_at).total_seconds() * 1000) if started_at else None,
+        "error_message": error_message,
+        "metadata": metadata or {},
+    }
+    return {k: v for k, v in payload.items() if v is not None}
+
+
+def log_steps_batch(payloads: List[Dict]) -> int:
+    """Insert many processing-log rows. Never raises (logs are diagnostic)."""
+    done = 0
+    for i in range(0, len(payloads), _BATCH_ROWS):
+        chunk = payloads[i:i + _BATCH_ROWS]
+        try:
+            with_retry(lambda: supabase.table("ndvi_processing_logs").insert(chunk).execute(),
+                       what=f"log batch insert ({len(chunk)})", attempts=2)
+            done += len(chunk)
+        except Exception as e:
+            logger.warning(f"log batch insert failed ({len(chunk)} rows): {type(e).__name__}: {e}")
+    return done
+
+
+def optical_history_batch(land_ids: List[str], days: int) -> Dict[str, List[Dict]]:
+    """optical_history for many lands in one request per 100 lands."""
+    from datetime import date, timedelta
+    since = (date.today() - timedelta(days=days)).isoformat()
+    out: Dict[str, List[Dict]] = {lid: [] for lid in land_ids}
+    for i in range(0, len(land_ids), 100):
+        chunk = land_ids[i:i + 100]
+        try:
+            res = with_retry(
+                lambda: supabase.table("ndvi_data")
+                    .select("land_id, acquisition_date, ndvi_value, scene_id, metadata")
+                    .in_("land_id", chunk)
+                    .eq("observation_source", "sentinel-2")
+                    .eq("observation_type", "observed")
+                    .not_.is_("ndvi_value", "null")
+                    .gte("acquisition_date", since)
+                    .order("acquisition_date", desc=True)
+                    .limit(30 * len(chunk)).execute(),
+                what=f"optical_history batch ({len(chunk)} lands)", attempts=3)
+            for r in res.data or []:
+                lst = out.setdefault(r["land_id"], [])
+                if len(lst) < 30:                       # same per-land cap as optical_history
+                    lst.append({k: r.get(k) for k in ("acquisition_date", "ndvi_value", "scene_id", "metadata")})
+        except Exception as e:
+            logger.warning(f"optical_history batch failed ({type(e).__name__}: {e}); per-land fallback")
+            for lid in chunk:
+                out[lid] = optical_history(lid, days)
+    return out
+
+
+def upsert_observations_batch(rows: List[Dict], run_started_at: datetime = None):
+    """Upsert observations for many lands. Returns (written, new, failed_lands).
+
+    written / new: {land_id: count}. new is measured from created_at >= run
+    start (as upsert_observations does), -1 when it could not be verified.
+    failed_lands: lands whose rows could not be stored even individually."""
+    by_land: Dict[str, List[Dict]] = {}
+    for r in rows:
+        by_land.setdefault(r["land_id"], []).append(r)
+    written: Dict[str, int] = {}
+    failed: set = set()
+    clean = _filter_to_schema(rows)
+    for i in range(0, len(clean), _BATCH_ROWS):
+        chunk = clean[i:i + _BATCH_ROWS]
+        lands_in = {r["land_id"] for r in chunk}
+        try:
+            with_retry(lambda: supabase.table("ndvi_data")
+                       .upsert(chunk, on_conflict="land_id,scene_id").execute(),
+                       what=f"observation batch upsert ({len(chunk)})")
+            for r in chunk:
+                written[r["land_id"]] = written.get(r["land_id"], 0) + 1
+        except Exception as e:
+            logger.warning(f"observation batch failed ({type(e).__name__}); isolating per land")
+            for lid in lands_in:
+                try:
+                    n, _ = upsert_observations(by_land[lid])
+                    written[lid] = n
+                except Exception:
+                    failed.add(lid)
+    new: Dict[str, int] = {}
+    ok = [lid for lid in written if lid not in failed]
+    if run_started_at is not None and ok:
+        for i in range(0, len(ok), 100):
+            chunk = ok[i:i + 100]
+            sids = list({r["scene_id"] for lid in chunk for r in by_land[lid] if r.get("scene_id")})
+            try:
+                res = with_retry(
+                    lambda: supabase.table("ndvi_data").select("land_id")
+                        .in_("land_id", chunk).in_("scene_id", sids)
+                        .gte("created_at", run_started_at.isoformat())
+                        .limit(10000).execute(),
+                    what=f"new-row count batch ({len(chunk)})", attempts=3)
+                for lid in chunk:
+                    new[lid] = 0
+                for r in res.data or []:
+                    new[r["land_id"]] = new.get(r["land_id"], 0) + 1
+            except Exception as e:
+                logger.warning(f"new-row count batch failed: {e}")
+                for lid in chunk:
+                    new[lid] = -1
+    return written, new, failed
+
+
+
+# ---------------------------------------------------------------------------
+# STREAMING LAND ITERATION (two-pass: light keys first, geometry per group)
+# ---------------------------------------------------------------------------
+# iter_lands() yields full rows including boundary geometry, and main grouped
+# ALL of them in memory before starting. At 1M lands that is gigabytes of
+# GeoJSON held at once. Pass 1 streams only the columns grouping needs; pass 2
+# fetches full rows one group at a time. Pagination is KEYSET (id > last id),
+# which stays O(page) at any depth, unlike OFFSET.
+_LAND_FULL_COLUMNS = ("id, tenant_id, area_acres, area_guntas, current_crop, "
+                      "current_crop_id, boundary_geom, boundary_polygon_old, "
+                      "mgrs_tile_id, tile_id, center_lat, center_lon, "
+                      "crop_cycle, transplant_date, planting_date, "
+                      "last_sowing_date, das, ndvi_thumbnail_url")
+
+
+def iter_land_keys(tenant_id: Optional[str] = None, page_size: int = 1000) -> Iterator[Dict]:
+    """Every eligible land's grouping keys only, keyset-paginated by id."""
+    last = None
+    while True:
+        q = (supabase.table("lands")
+             .select("id, tenant_id, tile_id, mgrs_tile_id, center_lat, center_lon")
+             .eq("is_active", True).is_("deleted_at", None)
+             .order("id").limit(page_size))
+        if tenant_id:
+            q = q.eq("tenant_id", tenant_id)
+        if last is not None:
+            q = q.gt("id", last)
+        try:
+            rows = with_retry(lambda: q.execute(), what="land keys page", attempts=3).data or []
+        except Exception:
+            logger.exception(f"land keys page failed after id {last}")
+            return
+        if not rows:
+            return
+        for r in rows:
+            yield r
+        last = rows[-1]["id"]
+        if len(rows) < page_size:
+            return
+
+
+def fetch_lands_by_ids(ids: List[str]) -> List[Dict]:
+    """Full land rows (geometry included) for one group, 100 ids per request.
+    Re-applies the eligibility filter, so a land deactivated between pass 1
+    and pass 2 is not processed."""
+    out: List[Dict] = []
+    for i in range(0, len(ids), 100):
+        chunk = ids[i:i + 100]
+        try:
+            res = with_retry(
+                lambda: supabase.table("lands").select(_LAND_FULL_COLUMNS)
+                    .in_("id", chunk).eq("is_active", True).is_("deleted_at", None)
+                    .order("id").execute(),
+                what=f"land rows ({len(chunk)})", attempts=3)
+            out.extend(res.data or [])
+        except Exception:
+            logger.exception(f"fetch_lands_by_ids failed for {len(chunk)} id(s)")
+    return out
+
+
+
+def upsert_water_layers_batch(records: List[Dict]) -> set:
+    """Water-layer records for a whole block in batches of 500. Returns the
+    (land_id, scene_id) pairs that could NOT be stored even row by row, so the
+    caller keeps those scenes out of the ledger (they retry next night)."""
+    failed: set = set()
+    for i in range(0, len(records), _BATCH_ROWS):
+        chunk = records[i:i + _BATCH_ROWS]
+        try:
+            with_retry(lambda: supabase.table("satellite_water_layers")
+                       .upsert(chunk, on_conflict="tenant_id,land_id,scene_id,layer_code").execute(),
+                       what=f"water layer batch ({len(chunk)})", attempts=3)
+        except Exception:
+            for rec in chunk:
+                try:
+                    with_retry(lambda r=rec: supabase.table("satellite_water_layers")
+                               .upsert(r, on_conflict="tenant_id,land_id,scene_id,layer_code").execute(),
+                               what=f"water layer {rec['land_id']}/{rec['scene_id']}", attempts=3)
+                except Exception:
+                    failed.add((rec["land_id"], rec["scene_id"]))
+    return failed
+
+
+
+# ---------------------------------------------------------------------------
+# BATCHED LAND UPDATES (sql/2026-09-23_ndvi_apply_land_updates.sql)
+# ---------------------------------------------------------------------------
+_LAND_RPC_AVAILABLE = True
+
+
+def apply_land_updates_batch(entries: List[Dict]) -> Optional[int]:
+    """One RPC per 500 lands. Returns lands updated, or None if the batch
+    function is unavailable / failed - the caller then uses the per-land path,
+    so nothing is lost before the migration is applied."""
+    global _LAND_RPC_AVAILABLE
+    if not _LAND_RPC_AVAILABLE or not entries:
+        return None
+    done = 0
+    try:
+        for i in range(0, len(entries), _BATCH_ROWS):
+            chunk = entries[i:i + _BATCH_ROWS]
+            res = with_retry(lambda: supabase.rpc("ndvi_apply_land_updates", {"p_updates": chunk}).execute(),
+                             what=f"land updates batch ({len(chunk)})", attempts=3)
+            done += int(res.data or 0)
+        return done
+    except Exception as e:
+        text = f"{type(e).__name__}: {e}"
+        if "ndvi_apply_land_updates" in text or "PGRST202" in text or "42883" in text:
+            _LAND_RPC_AVAILABLE = False
+            logger.warning("ndvi_apply_land_updates not present - per-land updates "
+                           "(apply sql/2026-09-23_ndvi_apply_land_updates.sql to batch them)")
+        else:
+            logger.warning(f"land updates batch failed ({text}) - per-land fallback for this block")
+        return None
+
+
+def update_land_snapshot_thumbnail(land_id: str, thumbnail_url: str) -> None:
+    """Save a newly uploaded one-time thumbnail when no snapshot moved."""
+    try:
+        with_retry(lambda: supabase.table("lands").update({"ndvi_thumbnail_url": thumbnail_url})
+                   .eq("id", land_id).execute(), what=f"thumbnail {land_id}", attempts=2)
+    except Exception as e:
+        logger.warning(f"thumbnail save failed for {land_id}: {type(e).__name__}: {e}")

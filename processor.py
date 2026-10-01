@@ -37,7 +37,7 @@ NEW  Per-scene exceptions are reported to the caller (scene_errors) so they
      reach ndvi_processing_logs instead of a console warning only.
 """
 
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Dict
 import time
 import numpy as np
 from shapely.geometry import shape
@@ -48,9 +48,14 @@ from raster_utils import (read_band, scl_masks, apply_crop_mask,
 from indices import (compute_indices, validate_index, index_statistics,
                      weighted_index_statistics, weighted_histogram)
 from sar_vegetation import rvi_from_gamma0
-from quality import assess, evidence_tier
-from raster_io import render_ndvi_png, storage_path, upload_png
+from quality import clean_pixel_tier, assess, evidence_tier
+from raster_io import (render_ndvi_png, storage_path, upload_png, render_zone_png, zone_path,
+                       render_truecolor_png, thumbnail_path)
+from zone_stats import compute_zones
+from tile_reader import subset_band, geometry_fingerprint
+from resource_budget import RASTER_CACHE, COUNTERS
 from config import (
+    S1_MODE,
     FIELD_BUFFER_M, NDVI_DECIMALS, ENABLE_S1_FALLBACK, NDVI_HISTOGRAM_BINS,
     QUALITY_SATURATION_PIXELS, MICRO_LAND_ACRES, MICRO_LAND_FACTOR,
     GEOMETRY_CONFIDENCE_FACTOR, PIXEL_AREA_M2, PIXEL_COUNT_TOLERANCE,
@@ -60,7 +65,11 @@ from config import (
 )
 from logger import logger
 
-PIPELINE_VERSION = "v3.1"
+# v3.2 (2026-09-23): measurement OUTPUT changed - parcel context now obeys the
+# MIN_EPC evidence floor and reports large fields as not_applicable; radar
+# picks the newest covering scene. The scene ledger is keyed on this version,
+# so bumping it makes every scene re-evaluate once under the corrected rules.
+PIPELINE_VERSION = "v3.2"
 
 from config import NDVI_IMAGE_BUCKET
 
@@ -74,6 +83,13 @@ def _supabase():
     return supabase
 
 # 10 m reference bands + the 20 m bands we resample onto them.
+# Upper bound on the per-scene band arrays handed to later stages (bytes).
+# A 56-acre holding at 10 m is ~0.4 MB per band; 32 MB leaves headroom for the
+# largest realistic parcel while keeping 10 parallel workers well inside the
+# runner's memory.
+BAND_CACHE_MAX_BYTES = 32 * 1024 * 1024   # one scene's arrays; see also
+# resource_budget.RASTER_CACHE, the process-wide ceiling across all workers.
+
 S2_BANDS_10M = ["B02", "B03", "B04", "B08"]
 S2_BANDS_20M = ["B05", "B8A", "B11"]
 
@@ -169,7 +185,10 @@ def process_acquisition(item, geom_measured, buffer_applied: bool,
                         reject_sink: Optional[list] = None,
                         error_sink: Optional[list] = None,
                         measured_area_m2: float = None,
-                        geom_wgs84=None) -> Optional[dict]:
+                        geom_wgs84=None,
+                        band_sink: Optional[dict] = None,
+                        block=None,
+                        history: Optional[List[dict]] = None) -> Optional[dict]:
     """
     Process ONE Sentinel-2 acquisition over ONE field.
     Returns a complete row dict, or None if the acquisition is rejected.
@@ -178,25 +197,83 @@ def process_acquisition(item, geom_measured, buffer_applied: bool,
     _t0 = time.time()
 
     try:
+        # --- band access: from the tile block when this scene was read for
+        # the whole block, else a per-parcel read. tile_reader.subset_band
+        # reproduces read_band exactly (tests/test_tile_reader.py asserts
+        # array, coverage, transform and dilated SCL equality), so values are
+        # identical either way and any block failure falls back silently.
+        def _band(bk, reference=None, categorical=False):
+            if block is not None:
+                try:
+                    got = subset_band(block, bk, geom_measured, reference=reference,
+                                      categorical=categorical)
+                except Exception as exc:
+                    # A block-slicing failure must never become a lost
+                    # observation: record why, then take the canonical path.
+                    COUNTERS.bump("block_subset_errors")
+                    logger.warning(f"block subset failed band={bk} scene={meta.get('scene_id')}: "
+                                   f"{type(exc).__name__}: {exc} - falling back to per-parcel read")
+                    got = None
+                if got is not None:
+                    return got
+                COUNTERS.bump("block_fallback_reads")
+            # read_band counts itself and classifies failures (raster_utils).
+            return read_band(item, bk, geom_measured, reference=reference,
+                             categorical=categorical)
+
         # --- reference grid: B04 at 10 m, WITH exact coverage -----------
-        b04, ref_transform, ref_crs, coverage = read_band(item, "B04", geom_measured)
+        b04, ref_transform, ref_crs, coverage = _band("B04")
         ref = (b04.shape, ref_transform, ref_crs, coverage)
 
         with_ref = {"B04": b04}
         for bk in S2_BANDS_10M:
             if bk != "B04":
-                with_ref[bk], _, _, _ = read_band(item, bk, geom_measured, reference=ref)
+                with_ref[bk], _, _, _ = _band(bk, reference=ref)
 
         for bk in S2_BANDS_20M:
             try:
-                with_ref[bk], _, _, _ = read_band(item, bk, geom_measured, reference=ref)
+                with_ref[bk], _, _, _ = _band(bk, reference=ref)
             except Exception as e:
                 logger.debug(f"Band {bk} unavailable on {meta['scene_id']}: {e}")
 
-        # --- SCL: nearest resampling, padded+dilated in read_band -------
-        scl, _, _, _ = read_band(item, "SCL", geom_measured, reference=ref, categorical=True)
+        # --- SCL: nearest resampling, padded+dilated --------------------
+        scl, _, _, _ = _band("SCL", reference=ref, categorical=True)
 
         masks = scl_masks(scl, coverage=coverage)
+
+        # --- SHARE THE BANDS ALREADY PAID FOR ----------------------------
+        # Every band above is a windowed HTTP read against Planetary Computer.
+        # The water-layer stage needs exactly these same bands over exactly
+        # this window, and used to read all six again per scene. Hand the
+        # arrays over instead. This happens for EVERY evaluated scene, not
+        # only accepted ones, so no water evidence is lost when NDVI rejects
+        # a scene (e.g. for cloud) that still shows open water in the clear
+        # part of the field. Bounded by BAND_CACHE_MAX_BYTES so a very large
+        # holding cannot exhaust the runner's memory; above that the water
+        # stage falls back to reading, exactly as before.
+        if band_sink is not None and meta.get("scene_id"):
+            try:
+                nbytes = sum(int(getattr(a, "nbytes", 0)) for a in with_ref.values())
+                # Two ceilings: this scene's own size, and the PROCESS-WIDE budget
+                # shared by every worker. The second one is what makes the memory
+                # bound real rather than theoretical (release audit, 2026-09-22):
+                # once the budget is spent, nothing is cached and the water stage
+                # reads exactly as it did before caching existed.
+                if nbytes > BAND_CACHE_MAX_BYTES:
+                    logger.debug(f"band cache skipped for {meta['scene_id']}: {nbytes} bytes > per-scene cap")
+                    COUNTERS.bump("band_cache_skipped_scene_cap")
+                elif not RASTER_CACHE.acquire(nbytes):
+                    logger.info(f"band cache skipped for {meta['scene_id']}: process raster budget full")
+                    COUNTERS.bump("band_cache_skipped_budget")
+                else:
+                    band_sink[meta["scene_id"]] = {
+                        "bands": with_ref, "masks": masks, "coverage": coverage,
+                        "ref_transform": ref_transform, "ref_crs": ref_crs,
+                        "geom_measured": geom_measured, "_nbytes": nbytes,
+                    }
+                    COUNTERS.bump("band_cache_stored")
+            except Exception as e:
+                logger.debug(f"band cache skipped: {type(e).__name__}: {e}")
 
         # --- AREA IDENTITY CHECK ----------------------------------------
         # EPC * 100 m2 must equal the measured polygon area. A large error
@@ -361,6 +438,12 @@ def process_acquisition(item, geom_measured, buffer_applied: bool,
                                   "boundary-delineation error"),
             "measurement_status": qa.measurement_status,
             "evidence_confidence": qa.evidence_confidence,
+            # Accuracy, stated for EVERY reading (agronomic decision 2026-09-23):
+            # the tier from clean interior pixels, and the smallest NDVI change
+            # between two passes this reading can prove at 95 % (2*sqrt(2)*SE).
+            "clean_interior_pixels": ndvi_stats.get("interior_epc"),
+            "accuracy_tier": clean_pixel_tier(ndvi_stats.get("interior_epc"))[2],
+            "min_provable_ndvi_change": _r(2.0 * np.sqrt(2.0) * float(ndvi_stats["se"])) if ndvi_stats.get("se") is not None else None,
             "measured_area_m2": round(measured_area_m2, 1) if measured_area_m2 else None,
             "raw_area_m2": round(raw_area_m2, 1) if raw_area_m2 else None,
             "erosion_applied_m": FIELD_BUFFER_M if buffer_applied else 0.0,
@@ -390,24 +473,64 @@ def process_acquisition(item, geom_measured, buffer_applied: bool,
                     src_crs=ref_crs,
                     geom_wgs84=geom_wgs84,
                 )
+                # IMAGES ARE A DOWNSTREAM PRODUCT (release review FIX-3): render
+                # here (CPU, data already in memory) but do NOT upload. The
+                # measurement completes without touching Storage; main.persist_block
+                # uploads a whole block's images concurrently, and a failed upload
+                # only clears the image fields - the NDVI row is still stored and
+                # the scene is left out of the ledger so it retries next night.
                 if rendered:
                     png, image_meta = rendered
                     path = storage_path(land["tenant_id"], land["id"],
                                         meta["acquisition_date"], meta["scene_id"])
-                    stored = upload_png(_supabase(), path, png)
-                    if stored:
-                        row["image_url"] = stored          # PATH, not a URL
-                        image_meta["storage_path"] = stored
-                        image_meta["bucket"] = NDVI_IMAGE_BUCKET
-                    else:
-                        image_meta["upload_failed"] = True
+                    row["image_url"] = path                # PATH, not a URL (cleared if upload fails)
+                    image_meta["storage_path"] = path
+                    image_meta["bucket"] = NDVI_IMAGE_BUCKET
+                    row.setdefault("_uploads", []).append({"path": path, "data": png, "kind": "ndvi"})
+                # three-colour zone map (field median +/- noise floor) - the farmer's default map view
+                zr = render_zone_png(idx.get("NDVI"), crop_w, ref_transform, ref_crs, geom_wgs84,
+                                     ndvi_stats.get("median") if ndvi_stats else None)
+                if zr and image_meta is not None:
+                    zpath = zone_path(land["tenant_id"], land["id"], meta["acquisition_date"], meta["scene_id"])
+                    image_meta["zones"] = {**zr[1], "storage_path": zpath}
+                    row.setdefault("_uploads", []).append({"path": zpath, "data": zr[0], "kind": "zones"})
             except Exception as e:
                 logger.warning(f"NDVI image step failed for land {land['id']} "
                                f"scene {meta['scene_id']}: {type(e).__name__}: {e}")
                 image_meta = {"error": f"{type(e).__name__}: {str(e)[:200]}"}
 
+        # ---- WHERE TO CHECK (quarter statistics; growth and moisture) ----------
+        try:
+            prev_zones = None
+            for h in (history or []):
+                if h.get("acquisition_date") and h["acquisition_date"] < meta["acquisition_date"]:
+                    md = h.get("metadata") if isinstance(h.get("metadata"), dict) else {}
+                    if md.get("zones"):
+                        prev_zones = md["zones"]; break
+            zones = compute_zones(idx, crop_w, masks["coverage"], masks["crop"],
+                                  ndvi_stats.get("median") if ndvi_stats else None,
+                                  evidence.get("ndvi_spatial_se"), qa.evidence_confidence, prev_zones)
+        except Exception as e:
+            logger.warning(f"zone stats failed for land {land['id']} scene {meta['scene_id']}: {type(e).__name__}: {e}")
+            zones = {"level": "none", "reason": f"error:{type(e).__name__}"}
+
+        # ---- ONE-TIME LAND THUMBNAIL (only while the land has none, clean pass) -
+        if ENABLE_NDVI_IMAGES and geom_wgs84 is not None and land.get("_thumbnail_pending") and (qa.cloud_fraction or 0) <= 0.10:
+            try:
+                tc = render_truecolor_png(with_ref.get("B02"), with_ref.get("B03"), with_ref.get("B04"),
+                                          masks["coverage"], ref_transform, ref_crs, geom_wgs84)
+                if tc:
+                    # deferred like every other image; persist_block sets
+                    # land["_thumbnail_path"] only after the upload succeeds
+                    tpath = thumbnail_path(land["tenant_id"], land["id"], meta["acquisition_date"])
+                    land["_thumbnail_upload"] = {"path": tpath, "data": tc[0], "kind": "thumbnail"}
+                    land["_thumbnail_pending"] = False
+            except Exception as e:
+                logger.warning(f"thumbnail step failed for land {land['id']}: {type(e).__name__}: {e}")
+
         row["metadata"] = {
             "evidence": evidence,
+            "zones": zones,
             "image": image_meta,
             "quality_breakdown": qa.to_dict(),
             "index_quality": index_quality,
@@ -475,13 +598,17 @@ def flag_temporal_outliers(rows: List[dict], history: List[dict]) -> None:
 # ---------------------------------------------------------------------------
 def process_land(land: dict, lookback_days: int = None,
                  scenes: Optional[List] = None,
-                 history: Optional[List[dict]] = None) -> Tuple[List[dict], dict]:
+                 history: Optional[List[dict]] = None,
+                 blocks: Optional[dict] = None,
+                 ledger: Optional[Dict[str, list]] = None,
+                 s1_search=None, s1_block_for=None) -> Tuple[List[dict], dict]:
     """
     Returns (rows, report). rows: one per accepted acquisition.
     report: {"optical_rejects": [...], "scene_errors": [...], "items": n,
              "deduped": n, "geometry_confidence": str}
     scenes: pre-fetched STAC items (tile group). None -> per-land search.
     """
+    land["_thumbnail_pending"] = not land.get("ndvi_thumbnail_url")
     report = {"optical_rejects": [], "scene_errors": [], "items": 0,
               "deduped": 0, "geometry_confidence": None}
 
@@ -500,14 +627,41 @@ def process_land(land: dict, lookback_days: int = None,
     items = dedupe_acquisitions(items, geom)
     report["deduped"] = report["items"] - len(items)
 
+    # --- INCREMENTAL: skip scenes this pipeline already measured ------------
+    # ledger: {scene_id: [(geometry_fingerprint, outcome), ...]} for THIS land.
+    # A scene is skipped only if it was evaluated with the SAME geometry (a
+    # boundary edit re-evaluates it) under the same pipeline version (checked
+    # by the caller's query). Transient read failures are never in the ledger,
+    # so they are retried.
+    fingerprint = geometry_fingerprint(geom)
+    report["geometry_fingerprint"] = fingerprint
+    report["prior_accepted_in_window"] = False
+    report["scenes_skipped_known"] = 0
+    if ledger:
+        pending = []
+        for it in items:
+            known = [o for fp, o in ledger.get(getattr(it, "id", None), []) if fp == fingerprint]
+            if known:
+                report["scenes_skipped_known"] += 1
+                if "accepted" in known:
+                    report["prior_accepted_in_window"] = True
+            else:
+                pending.append(it)
+        items = pending
+    report["pending_scene_ids"] = [getattr(it, "id", None) for it in items]
+
     rows = []
+    report["scene_bands"] = {}
     for item in items:
         r = process_acquisition(item, geom_meas, buffer_applied, land, geom_conf,
+                                block=(blocks or {}).get(getattr(item, "id", None)),
                                 raw_area_m2=raw_area_m2,
                                 reject_sink=report["optical_rejects"],
                                 error_sink=report["scene_errors"],
                                 measured_area_m2=measured_area_m2,
-                                geom_wgs84=geom_meas)
+                                geom_wgs84=geom_meas,
+                                band_sink=report["scene_bands"],
+                                history=history)
         if r:
             r["field_area_m2"] = round(raw_area_m2, 1)
             rows.append(r)
@@ -518,13 +672,9 @@ def process_land(land: dict, lookback_days: int = None,
             f"Land {land['id']}: {len(rows)}/{len(items)} acquisitions accepted "
             f"(dates {rows[-1]['acquisition_date']} .. {rows[0]['acquisition_date']})"
         )
-        return rows, report
-
-    if not ENABLE_S1_FALLBACK:
-        return [], report
 
     rejects = report["optical_rejects"]
-    if rejects:
+    if rejects and not rows:
         reasons = {}
         for r in rejects:
             key = (r.get("reason") or "unknown").split()[0]
@@ -532,9 +682,38 @@ def process_land(land: dict, lookback_days: int = None,
         cf = [r["cloud_fraction"] for r in rejects if r.get("cloud_fraction") is not None]
         logger.info(f"Land {land['id']}: optical 0/{len(items)} accepted | reasons={reasons}"
                     + (f" | mean_field_cloud={sum(cf)/len(cf):.0%}" if cf else ""))
+
+    if S1_MODE == "always" and ENABLE_S1_FALLBACK:
+        # Radar is a signal of its own, not only a stand-in for optical: the
+        # newest pass is measured for EVERY land (the ledger skips it once
+        # measured), so a field under monsoon cloud still gets fresh evidence.
+        # Radar rejections are attached to the radar row as before.
+        s1_rows = _process_s1(land, geom_meas, buffer_applied, geom_conf, raw_area_m2,
+                              report, measured_area_m2, ledger=ledger, s1_search=s1_search,
+                              s1_block_for=s1_block_for) or []
+        for row in s1_rows:
+            row.setdefault("metadata", {})["optical_rejects"] = rejects[:6]
+        return list(rows) + list(s1_rows), report
+
+    if rows:
+        return rows, report
+
+    # Nothing new was accepted, but an optical scene in this window WAS
+    # accepted on an earlier night. The pre-ledger pipeline would have re-read
+    # and re-accepted it, so it would NOT have fallen back to Sentinel-1.
+    # Preserve that exactly: no radar fallback here.
+    if report.get("prior_accepted_in_window"):
+        logger.info(f"Land {land['id']}: no new optical acceptance; "
+                    f"{report['scenes_skipped_known']} scene(s) already measured - unchanged")
+        return [], report
+
+    if not ENABLE_S1_FALLBACK:
+        return [], report
+
     logger.info(f"Land {land['id']}: no usable optical data, trying Sentinel-1")
     s1 = _process_s1(land, geom_meas, buffer_applied, geom_conf, raw_area_m2,
-                     report, measured_area_m2)
+                     report, measured_area_m2, ledger=ledger, s1_search=s1_search,
+                     s1_block_for=s1_block_for)
     for row in s1:
         row.setdefault("metadata", {})["optical_rejects"] = rejects[:6]
     return s1, report
@@ -545,21 +724,64 @@ def process_land(land: dict, lookback_days: int = None,
 # ---------------------------------------------------------------------------
 def _process_s1(land: dict, geom_measured, buffer_applied: bool,
                 geom_conf: str, raw_area_m2: float, report: dict,
-                measured_area_m2: float = None) -> List[dict]:
-    pairs = search_s1(geom_measured)
+                measured_area_m2: float = None, ledger: Optional[Dict[str, list]] = None,
+                s1_search=None, s1_block_for=None) -> List[dict]:
+    # s1_search: one radar search shared by the whole read-block (main.py),
+    # newest first. Keep only scenes whose footprint covers THIS field, so a
+    # block-level search never hands a field a scene that does not contain it.
+    block_pairs = s1_search() if s1_search is not None else None
+    if block_pairs is not None:
+        from shapely.geometry import shape as _shape
+        pairs = []
+        for coll, it in block_pairs:
+            try:
+                if _shape(it.geometry).intersects(geom_measured):
+                    pairs.append((coll, it))
+            except Exception:
+                pairs.append((coll, it))           # no usable footprint: keep, never drop data
+    else:
+        # no shared search, or it failed: this field's own search, as before
+        pairs = search_s1(geom_measured)
     if not pairs:
         return []
 
     collection, item = pairs[0]
     meta = acquisition_meta(item)
+
+    # Incremental: this radar scene was already measured for this boundary on
+    # an earlier night -> nothing new; do not re-read VV/VH.
+    fp = report.get("geometry_fingerprint")
+    known = [o for f, o in (ledger or {}).get(meta["scene_id"], []) if f == fp] if fp else []
+    if known:
+        report["scenes_skipped_known"] = int(report.get("scenes_skipped_known") or 0) + 1
+        if "accepted" in known:
+            report["prior_accepted_in_window"] = True
+        return []
+    report.setdefault("s1_rejects", [])
     _t0 = time.time()
 
     try:
         assets = {k.lower(): k for k in item.assets}
         # SAME coverage machinery as the optical path - one implementation.
-        vv, ref_transform, ref_crs, coverage = read_band(item, assets["vv"], geom_measured)
+        # Served from a block-wide VV/VH read when main.py provides one
+        # (subset_band reproduces read_band exactly), else per-parcel.
+        s1_block = s1_block_for(item) if s1_block_for is not None else None
+
+        def _s1_band(bk, reference=None):
+            if s1_block is not None:
+                try:
+                    got = subset_band(s1_block, bk, geom_measured, reference=reference)
+                    if got is not None:
+                        return got
+                except Exception as exc:
+                    COUNTERS.bump("block_subset_errors")
+                    logger.warning(f"S1 block subset failed band={bk}: {type(exc).__name__}: {exc}")
+                COUNTERS.bump("block_fallback_reads")
+            return read_band(item, bk, geom_measured, reference=reference)
+
+        vv, ref_transform, ref_crs, coverage = _s1_band(assets["vv"])
         ref = (vv.shape, ref_transform, ref_crs, coverage)
-        vh, _, _, _ = read_band(item, assets["vh"], geom_measured, reference=ref)
+        vh, _, _, _ = _s1_band(assets["vh"], reference=ref)
 
         n_fp = int(np.count_nonzero(coverage > 0))
         epc_total = float(coverage.sum())
@@ -574,6 +796,8 @@ def _process_s1(land: dict, geom_measured, buffer_applied: bool,
         s1_status, s1_ev = evidence_tier(epc_valid, s1_purity)
         if epc_valid < MIN_EPC:
             logger.info(f"REJECT radar | land={land['id']} | EPC {epc_valid:.2f} < {MIN_EPC}")
+            report["s1_rejects"].append({"scene_id": meta["scene_id"], "acquisition_date": meta["acquisition_date"],
+                                         "reason": f"EPC {epc_valid:.2f} < {MIN_EPC}"})
             return []
         _px = res.get("valid_pixels") or 0
         _s1_quality = 0.50 * min(epc_valid / EPC_SATURATION, 1.0)
@@ -591,6 +815,8 @@ def _process_s1(land: dict, geom_measured, buffer_applied: bool,
 
         if not res["accepted"]:
             logger.info(f"REJECT radar | land={land['id']} | {res['reject_reason']}")
+            report["s1_rejects"].append({"scene_id": meta["scene_id"], "acquisition_date": meta["acquisition_date"],
+                                         "reason": str(res.get("reject_reason"))[:200]})
             return []
 
         return [{

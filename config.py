@@ -6,6 +6,8 @@ own broader list and never imported this file. In v2 every module imports from
 here; no module defines a local copy.
 """
 
+import os
+
 # ---------------------------------------------------------------------------
 # TEMPORAL WINDOW
 # ---------------------------------------------------------------------------
@@ -144,6 +146,16 @@ QUALITY_SATURATION_PIXELS = 50
 # v2 computes the Radar Vegetation Index from calibrated gamma0 into its OWN
 # column - never mixed into ndvi_value.
 ENABLE_S1_FALLBACK = True
+
+# Radar (Sentinel-1) mode - agronomic/production decision 2026-09-24.
+#   "always"   : measure the newest radar pass for EVERY land, every night
+#                (skipped via the ledger once measured). In monsoon 15 of 30
+#                live lands had no optical reading newer than August, and two
+#                lands with an early-September optical reading never had radar
+#                tried again because radar ran only when optical was absent.
+#   "fallback" : the previous behaviour - radar only when no optical scene in
+#                the window was accepted.
+S1_MODE = os.getenv("S1_MODE", "always")
 # Aligned with MIN_VALID_PIXELS. Previously 12 while the optical gate was
 # lowered to 8, so radar silently kept the stricter rule - the 2026-08-07 run
 # still logged "valid_pixels 8 < 12" after the optical threshold had moved.
@@ -156,7 +168,47 @@ S1_MIN_VALID_PIXELS = 8
 # of 100 arbitrary lands, while reporting success.
 LAND_PAGE_SIZE = 500
 MAX_LANDS_PER_RUN = None            # None == process every eligible land
-TILE_WORKERS = 4
+# Per-land work is network-bound (windowed HTTP reads against Planetary
+# Computer), not CPU-bound: the 2026-09-22 run spent 1,102 s of per-land time
+# in 297 s of wall clock on 4 workers.
+#
+# The default stays at the MEASURED baseline of 4. The release audit was right
+# that 10 is an experiment, not a proven constant: Planetary Computer throttles
+# by origin and subscription, and a faster run that causes 429/5xx retries is
+# no optimisation at all. Raise it for a canary WITHOUT a code change:
+#     TILE_WORKERS=10 python main.py
+# then compare against the 4-worker baseline using the counters written into
+# ndvi_run_summary.notes (raster_reads, read_errors_429,
+# read_errors_5xx_or_timeout, peak_rss_mb, raster_cache_peak_mb).
+TILE_WORKERS = int(os.getenv("TILE_WORKERS", "4"))
+
+# Tile-scene batched reads: one windowed read per band per scene serves every
+# land in a block instead of one read per land. Values are unchanged
+# (tile_reader.subset_band reproduces read_band exactly; tests assert it).
+# Kill switch: TILE_BATCH_READS=0 restores per-land reads.
+TILE_BATCH_READS = os.getenv("TILE_BATCH_READS", "1") not in ("0", "false", "False")
+
+# Largest ground span of one read block. 5 km at 10 m is ~500x500 px per band
+# (~1 MB float32), so a scene's 8 bands for a block stay near 8 MB. Bigger
+# blocks mean fewer reads but more memory; the process-wide ceiling in
+# resource_budget.RASTER_CACHE applies regardless.
+BLOCK_SPAN_M = float(os.getenv("BLOCK_SPAN_M", "5000"))
+
+# Work cap per read-block: a dense village is split into several blocks
+# rather than becoming one straggler that a single worker grinds through.
+BLOCK_MAX_LANDS = int(os.getenv("BLOCK_MAX_LANDS", "200"))
+
+# Incremental processing: skip (land, scene) pairs already measured by this
+# pipeline version for the land's current boundary (ledger table
+# ndvi_scene_evaluations). Measured 2026-09-17..23: 0-2 genuinely new optical
+# rows per night while every run re-measured all ~7 scenes for all lands.
+# Needs sql/2026-09-23_ndvi_scene_evaluations.sql; without it nothing is
+# skipped. Per run: `python main.py --reprocess`. Globally: INCREMENTAL_SCENES=0.
+INCREMENTAL_SCENES = os.getenv("INCREMENTAL_SCENES", "1") not in ("0", "false", "False")
+
+# Concurrent image uploads per block (NDVI image, zone map, water layers,
+# thumbnail). Uploads are I/O-bound and now happen outside the measurement.
+IMAGE_UPLOAD_WORKERS = int(os.getenv("IMAGE_UPLOAD_WORKERS", "8"))
 SCENE_WORKERS = 2
 
 # ---------------------------------------------------------------------------
@@ -234,6 +286,32 @@ MIN_EPC = 3.0           # below this: no defensible field statistic
 # Share of a contributing cell that must sit inside the field before the
 # cell is considered "interior" rather than boundary-influenced.
 INTERIOR_COVERAGE = 0.99
+
+# ---------------------------------------------------------------------------
+# ACCURACY TIERS - agronomic decision, 2026-09-23 (applies to EVERY land)
+# ---------------------------------------------------------------------------
+# A 10 m pixel on a field's edge mixes the bund, the neighbour's crop and
+# boundary trees, and imagery can sit a few metres off the ground. So a
+# reading is graded on CLEAN INTERIOR pixels (cells >= INTERIOR_COVERAGE
+# inside the boundary; indices.weighted_index_statistics "interior_epc"),
+# never on paper area. A 10-guntha field has only ~3-5 clean pixels; a
+# 20-guntha field ~10.
+#   With within-field NDVI spread ~0.06, the smallest change two passes can
+#   prove at 95 % is 2*sqrt(2)*0.06/sqrt(n): 0.17 at 1 px, 0.10 at 3 px,
+#   0.05 at 10 px - the level at which early crop stress becomes detectable.
+# Every reading is KEPT and published with its accuracy; the tier only says
+# how far it may be trusted.
+CLEAN_PX_REAL = 10.0   # >= 10 clean pixels: real value (evidence "high")
+CLEAN_PX_MIN = 3.0     # 3-10: indicative (evidence "low"); below 3: too small
+                       # for a 10 m satellite (evidence "insufficient") - stored
+                       # and shown, never allowed to raise an alert (the alert
+                       # layer blocks evidence rank < 1).
+
+# Neighbour comparison: a ring of NEIGHBOUR pixels outside the field.
+CONTEXT_RING_GAP_M = 10.0     # skip the first pixel outside the boundary (bund / shared edge)
+CONTEXT_RING_MAX_M = 150.0    # a neighbourhood, not the landscape
+CONTEXT_CLEAN_PX_REAL = 20    # robust spread (MAD) is unstable below ~20 values
+CONTEXT_CLEAN_PX_MIN = 3      # below this there is no comparison at all
 
 # EPC at which the support term of quality_score saturates. Matches the
 # legacy QUALITY_SATURATION_PIXELS so large-field scores stay comparable.

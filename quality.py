@@ -41,6 +41,7 @@ from config import (
     MICRO_LAND_ACRES, MICRO_LAND_FACTOR, GEOMETRY_CONFIDENCE_FACTOR,
     MAX_FIELD_CLOUD_FRACTION, MAX_FIELD_SHADOW_FRACTION, MAX_FIELD_SNOW_FRACTION,
     EPC_STRONG, EPC_LIMITED, EPC_WEAK, MIN_EPC, EPC_SATURATION,
+    CLEAN_PX_REAL, CLEAN_PX_MIN,
     LOW_PURITY_THRESHOLD, LOW_PURITY_FACTOR,
 )
 
@@ -49,6 +50,20 @@ _TIERS = [("OBSERVED_STRONG", "high"),
           ("OBSERVED_LIMITED", "medium"),
           ("OBSERVED_WEAK", "low"),
           ("INSUFFICIENT_SPATIAL_SUPPORT", "insufficient")]
+
+
+def clean_pixel_tier(interior_epc: float) -> tuple:
+    """(measurement_status, evidence_confidence, tier) from CLEAN interior
+    pixels - the accuracy rule for every optical field reading (config
+    CLEAN_PX_REAL / CLEAN_PX_MIN). Edge pixels are already down-weighted by
+    their coverage; only whole interior pixels count here, so a long narrow
+    field is graded on what the satellite can really see inside it."""
+    n = float(interior_epc or 0.0)
+    if n >= CLEAN_PX_REAL:
+        return "OBSERVED_STRONG", "high", "real"
+    if n >= CLEAN_PX_MIN:
+        return "OBSERVED_WEAK", "low", "indicative"
+    return "INSUFFICIENT_SPATIAL_SUPPORT", "insufficient", "too_small"
 
 
 def evidence_tier(epc: float, purity: float = None) -> tuple:
@@ -211,7 +226,11 @@ def assess(masks: dict,
     score *= GEOMETRY_CONFIDENCE_FACTOR.get(geometry_confidence, 0.5)
 
     # ---- SPATIAL SUPPORT TIER ------------------------------------------
-    status, ev_conf = evidence_tier(epc_valid if epc_valid else None, purity)
+    interior_epc = (stats or {}).get("interior_epc")
+    if interior_epc is not None:
+        status, ev_conf, _tier = clean_pixel_tier(interior_epc)
+    else:
+        status, ev_conf = evidence_tier(epc_valid if epc_valid else None, purity)
     # Weak support caps decision confidence outright; it is not averaged
     # away against a clean sky.
     if ev_conf == "medium":
@@ -241,9 +260,10 @@ def assess(masks: dict,
         reject = f"field shadow {masks['shadow_fraction']:.0%} > {MAX_FIELD_SHADOW_FRACTION:.0%}"
     elif masks.get("snow_fraction", 0.0) > MAX_FIELD_SNOW_FRACTION:
         reject = f"field snow/bright-cloud {masks['snow_fraction']:.0%} > {MAX_FIELD_SNOW_FRACTION:.0%}"
-    elif epc_valid and epc_valid < MIN_EPC:
-        reject = (f"effective_pixel_count {epc_valid:.2f} < {MIN_EPC} "
-                  f"({valid_px} cells, purity {purity if purity is not None else float('nan'):.2f})")
+    # A small field is NOT rejected for being small (agronomic decision
+    # 2026-09-23): it is kept and labelled by clean_pixel_tier, down to
+    # "insufficient", which the alert layer never acts on. Only a reading with
+    # no statistics at all falls through to the valid-pixel check below.
     elif not epc_valid and valid_px < MIN_VALID_PIXELS:
         reject = f"valid_pixels {valid_px} < {MIN_VALID_PIXELS}"
     elif valid_fraction < MIN_VALID_FRACTION:

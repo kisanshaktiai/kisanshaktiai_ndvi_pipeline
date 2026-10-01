@@ -22,6 +22,10 @@ def process_land_with_context(
     scenes: Optional[List] = None,
     history: Optional[List[dict]] = None,
     context_area_m2: float = 4046.8564224,
+    blocks: Optional[dict] = None,
+    ledger: Optional[dict] = None,
+    s1_search=None,
+    s1_block_for=None,
 ) -> Tuple[List[dict], dict]:
     """Run the existing land processor, then attach same-scene context evidence."""
     selected_scenes = scenes
@@ -36,6 +40,10 @@ def process_land_with_context(
         lookback_days=lookback_days,
         scenes=selected_scenes,
         history=history,
+        blocks=blocks,
+        ledger=ledger,
+        s1_search=s1_search,
+        s1_block_for=s1_block_for,
     )
 
     if not rows:
@@ -50,13 +58,24 @@ def process_land_with_context(
     by_scene = {getattr(scene, "id", None): scene for scene in (selected_scenes or [])}
     enriched = 0
     context_errors = 0
+    # Reason counts travel in the report -> ndvi_processing_logs metadata, so a
+    # drop in cohort coverage is diagnosable from the database rather than only
+    # from the console (10 of 22 enrichments failed on 2026-09-22 with no
+    # recorded reason).
+    reasons: dict = {}
 
+    def _note(reason: str) -> None:
+        reasons[reason] = reasons.get(reason, 0) + 1
+
+    not_applicable = 0            # retained for report compatibility; every field now gets a ring
+    insufficient = 0
     for row in rows:
         if row.get("ndvi_value") is None:
             continue
         scene = by_scene.get(row.get("scene_id"))
         if scene is None:
             context_errors += 1
+            _note("scene_not_in_selected_set")
             logger.warning(
                 "Context skipped for land %s scene %s: scene not available in selected set",
                 land["id"], row.get("scene_id"),
@@ -67,16 +86,24 @@ def process_land_with_context(
                 scene,
                 parcel_geom_wgs84=parcel_geom,
                 target_area_m2=context_area_m2,
+                block=(blocks or {}).get(row.get("scene_id")),
             )
             if context is None:
                 context_errors += 1
+                _note("extractor_returned_none")
+                continue
+            if context.get("status") == "insufficient_context":
+                # recorded as what it is; no delta / z, so no neighbour verdict
+                row.setdefault("metadata", {})["parcel_context"] = context
+                insufficient += 1
                 continue
             row.setdefault("metadata", {})["parcel_context"] = add_parcel_delta(
-                context, row.get("ndvi_value")
+                context, row.get("ndvi_value"), row.get("ndvi_spatial_se")
             )
             enriched += 1
         except Exception as exc:
             context_errors += 1
+            _note(type(exc).__name__)
             logger.warning(
                 "Context extraction failed land=%s scene=%s: %s: %s",
                 land["id"], row.get("scene_id"), type(exc).__name__, str(exc)[:240],
@@ -87,6 +114,9 @@ def process_land_with_context(
         "target_total_area_m2": context_area_m2,
         "rows_enriched": enriched,
         "rows_failed": context_errors,
+        "rows_not_applicable": not_applicable,
+        "rows_insufficient_context": insufficient,
+        "reasons": reasons,
         "measurement_unchanged": True,
         "status": "observed_context_only",
     }

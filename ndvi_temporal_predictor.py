@@ -234,7 +234,11 @@ def write_predictions(tenant_id: Optional[str] = None) -> dict:
         "model_version": MODEL_VERSION,
         "validation_status": "unvalidated",
     }
-    log_step("INTELLIGENCE_FORECAST", "completed", tenant_id, now, metadata=result)
+    # db.log_step is keyword-only; the positional call raised TypeError on the
+    # last line of every run (after predictions were written), and the job's
+    # `| tee` hid the failure from GitHub Actions.
+    log_step(processing_step="INTELLIGENCE_FORECAST", step_status="completed",
+             tenant_id=tenant_id, started_at=now, metadata=result)
     return result
 
 
