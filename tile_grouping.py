@@ -44,7 +44,7 @@ have OOM'd on a GitHub Actions runner had its two silent bugs been fixed.
 """
 
 from collections import defaultdict
-from typing import Dict, List, Iterable
+from typing import Optional, Dict, List, Iterable
 from shapely.geometry import shape
 
 from sentinel_search import search_s2
@@ -68,8 +68,19 @@ def group_lands_by_tile(lands: Iterable[dict]) -> Dict[str, List[dict]]:
     """
     groups: Dict[str, List[dict]] = defaultdict(list)
     for land in lands:
-        tile = land.get("tile_id") or land.get("mgrs_tile_id")
-        groups[str(tile) if tile else "__untiled__"].append(land)
+        # Group by an EXACT spatial key from the land's own coordinates, for
+        # every land. This is not a tile guess: scenes_for_group searches the
+        # UNION of the group's geometries, so the key only decides which
+        # neighbouring lands share one search and one set of block reads.
+        # Measured 2026-09-22: 28 of 30 lands had no stored tile and bypassed
+        # every batching optimisation, and the 2 that had one sat in the same
+        # district as the other 28 but were grouped apart. A stored tile id is
+        # used only when a land has no usable coordinates at all.
+        key = spatial_group_key(land)
+        if not key:
+            tile = land.get("tile_id") or land.get("mgrs_tile_id")
+            key = str(tile) if tile else None
+        groups[key or "__untiled__"].append(land)
 
     tiled = {k: v for k, v in groups.items() if k != "__untiled__"}
     untiled = len(groups.get("__untiled__", []))
@@ -131,3 +142,42 @@ def log_group_plan(groups: Dict[str, List[dict]]) -> None:
     for tile, lands in sorted(groups.items(), key=lambda kv: -len(kv[1])):
         label = "untiled (individual)" if tile == "__untiled__" else f"tile {tile}"
         logger.info(f"  {label}: {len(lands)} land(s)")
+
+
+
+# 100 km UTM cells: the same size as an MGRS square, so a group needs roughly
+# the same imagery as a Sentinel-2 tile would.
+SPATIAL_GROUP_CELL_M = 100_000.0
+_UTM_TRANSFORMERS: Dict[str, object] = {}
+
+
+def spatial_group_key(land: dict) -> Optional[str]:
+    """Deterministic 'utm<zone><N|S>:<e100km>:<n100km>' from the land's centre.
+
+    Uses center_lat/center_lon (present on every active land, verified
+    2026-09-23); falls back to the boundary centroid. None only if the land has
+    neither - then it is processed alone, exactly as before."""
+    lat, lon = land.get("center_lat"), land.get("center_lon")
+    try:
+        lat, lon = float(lat), float(lon)
+    except (TypeError, ValueError):
+        lat = lon = None
+    if lat is None or lon is None:
+        raw = land.get("boundary_geom") or land.get("boundary_polygon_old")
+        try:
+            c = shape(raw).centroid
+            lat, lon = c.y, c.x
+        except Exception:
+            return None
+    if not (-80.0 <= lat <= 84.0 and -180.0 <= lon <= 180.0):
+        return None
+    zone = int((lon + 180.0) // 6.0) + 1
+    hemi = "N" if lat >= 0 else "S"
+    code = f"EPSG:{32600 + zone if hemi == 'N' else 32700 + zone}"
+    t = _UTM_TRANSFORMERS.get(code)
+    if t is None:
+        from pyproj import Transformer
+        t = Transformer.from_crs("EPSG:4326", code, always_xy=True)
+        _UTM_TRANSFORMERS[code] = t
+    e, n = t.transform(lon, lat)
+    return f"utm{zone}{hemi}:{int(e // SPATIAL_GROUP_CELL_M)}:{int(n // SPATIAL_GROUP_CELL_M)}"

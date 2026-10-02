@@ -45,7 +45,7 @@ concurrency:
 
 jobs:
   run-ndvi:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # 90 min was the binding limit at ~400 lands: the job is killed mid-run and
     # the night's observations are lost. GitHub's hard ceiling is 360 min.
     timeout-minutes: 330
@@ -57,10 +57,10 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.11"
           cache: pip
@@ -87,7 +87,7 @@ jobs:
 
       - name: Upload run logs
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: ndvi-pipeline-log-${{ github.run_id }}
           path: |

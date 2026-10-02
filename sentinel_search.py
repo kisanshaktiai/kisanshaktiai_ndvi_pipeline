@@ -115,6 +115,12 @@ def search_s1(geometry, days: int = None, end: datetime = None) -> List:
             items = [i for i in search.items()
                      if "vv" in {k.lower() for k in i.assets}
                      and "vh" in {k.lower() for k in i.assets}]
+            # Planetary Computer does not advertise STAC sort conformance (the
+            # client warns "Server does not conform to SORT" on every run), so
+            # the server's order is not guaranteed. Callers take the FIRST pair
+            # as the newest acquisition - make that true here.
+            items.sort(key=lambda i: i.datetime.timestamp() if i.datetime else float("-inf"),
+                       reverse=True)
             if items:
                 logger.info(f"S1 search: {len(items)} {collection} acquisitions")
                 return [(collection, i) for i in items]

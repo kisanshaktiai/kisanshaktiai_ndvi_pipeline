@@ -320,6 +320,7 @@ def weighted_index_statistics(arr: np.ndarray, weights: np.ndarray) -> dict:
         "epc": round(sw, 4),
         "n_cells": n_cells,
         "purity": round(sw / n_cells, 4),
+        "interior_epc": round(interior, 4),   # clean interior pixels
         "interior_share": round(interior / sw, 4),
         "boundary_share": round(1.0 - interior / sw, 4),
         "n_eff": round(n_eff, 4),

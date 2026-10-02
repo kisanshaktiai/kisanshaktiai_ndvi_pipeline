@@ -7,9 +7,13 @@ validation workflow and are therefore never produced here.
 """
 from __future__ import annotations
 
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 from db import supabase, with_retry
+
+# Output version - part of the scene ledger identity (main.PROCESSING_IDENTITY).
+# Bump it whenever the observed intelligence record incl. accuracy fields changes, so every scene is re-evaluated.
+INTELLIGENCE_VERSION = "intel-observed-v2"
 
 
 def _num(value):
@@ -70,6 +74,7 @@ def build_observed_intelligence(row: Dict) -> Optional[Dict]:
         "spatial_anomaly_json": {
             "parcel_context_delta": _num(ctx.get("parcel_context_delta")),
             "parcel_context_robust_z": _num(ctx.get("parcel_context_robust_z")),
+            "zones": (meta.get("zones") if isinstance(meta, dict) else None),
         },
         "uncertainty_json": {
             "scope": "observed measurement/context evidence; no predictive model",
@@ -81,6 +86,12 @@ def build_observed_intelligence(row: Dict) -> Optional[Dict]:
         "evidence_json": {
             "observed_or_predicted": "observed",
             "measurement_status": row.get("measurement_status"),
+            # accuracy the app shows next to every value
+            "accuracy_tier": evidence.get("accuracy_tier"),
+            "clean_interior_pixels": _num(evidence.get("clean_interior_pixels")),
+            "ndvi_lower_95": _num(evidence.get("ndvi_lower_95_spatial")),
+            "ndvi_upper_95": _num(evidence.get("ndvi_upper_95_spatial")),
+            "min_provable_ndvi_change": _num(evidence.get("min_provable_ndvi_change")),
             "spatial_stat_method": row.get("spatial_stat_method") or evidence.get("spatial_stat_method"),
             "effective_pixel_count": _num(row.get("effective_pixel_count")),
             "coverage_weighted_purity": _num(row.get("coverage_weighted_purity")),
@@ -117,3 +128,36 @@ def persist_observed_intelligence(row: Dict) -> bool:
         attempts=3,
     )
     return True
+
+
+
+def persist_observed_intelligence_batch(rows: List[Dict]):
+    """Observed-intelligence records for many rows. Returns (written, failed)
+    as {land_id: count}. A failed batch is retried row by row so one bad
+    record cannot fail its neighbours' persistence."""
+    records = []
+    for row in rows:
+        rec = build_observed_intelligence(row)
+        if rec is not None:
+            records.append(rec)
+    written: Dict[str, int] = {}
+    failed: Dict[str, int] = {}
+    for i in range(0, len(records), 500):
+        chunk = records[i:i + 500]
+        try:
+            with_retry(lambda: supabase.table("ndvi_intelligence")
+                       .upsert(chunk, on_conflict="tenant_id,land_id,scene_id").execute(),
+                       what=f"observed intelligence batch ({len(chunk)})", attempts=3)
+            for rec in chunk:
+                written[rec["land_id"]] = written.get(rec["land_id"], 0) + 1
+        except Exception:
+            for rec in chunk:
+                try:
+                    with_retry(lambda: supabase.table("ndvi_intelligence")
+                               .upsert(rec, on_conflict="tenant_id,land_id,scene_id").execute(),
+                               what=f"observed intelligence {rec['land_id']}/{rec['scene_id']}",
+                               attempts=3)
+                    written[rec["land_id"]] = written.get(rec["land_id"], 0) + 1
+                except Exception:
+                    failed[rec["land_id"]] = failed.get(rec["land_id"], 0) + 1
+    return written, failed

@@ -31,9 +31,79 @@ from logger import logger
 # ---------------------------------------------------------------------------
 # GEOMETRY
 # ---------------------------------------------------------------------------
+import functools as _functools
+import threading as _threading
+
+_TL = _threading.local()
+
+
+def _wgs84_to(crs_key: str):
+    """One pyproj Transformer per target CRS per THREAD (Transformer objects
+    are not shared across threads). Building one costs milliseconds; it was
+    rebuilt for every band of every parcel."""
+    cache = getattr(_TL, "transformers", None)
+    if cache is None:
+        cache = _TL.transformers = {}
+    t = cache.get(crs_key)
+    if t is None:
+        t = cache[crs_key] = Transformer.from_crs("EPSG:4326", crs_key, always_xy=True)
+    return t
+
+
+@_functools.lru_cache(maxsize=8192)
+def _reproject_cached(geom, crs_key: str):
+    return shp_transform(_wgs84_to(crs_key).transform, geom)
+
+
 def reproject_geometry(geom, dst_crs):
-    t = Transformer.from_crs("EPSG:4326", dst_crs, always_xy=True)
-    return shp_transform(t.transform, geom)
+    """WGS84 geometry -> dst_crs. The same field geometry was projected 8+ times
+    per parcel (once per band and again for context); results are cached by
+    geometry VALUE (shapely 2 hashes and compares by value) and CRS, so the
+    output is identical to recomputing it."""
+    key = str(dst_crs)
+    try:
+        return _reproject_cached(geom, key)
+    except TypeError:                                   # unhashable input: compute directly
+        return shp_transform(_wgs84_to(key).transform, geom)
+
+
+def source_crs(src, item=None, band_key: str = ""):
+    """CRS of an opened raster, falling back to the STAC projection extension.
+
+    Observed in production (run 2026-10-01, land 8897e53d): rasterio returned an
+    EMPTY CRS for one Sentinel-1 RTC asset, so Transformer.from_crs("EPSG:4326", "")
+    raised `CRSError: Invalid projection: ""` and the parcel got no radar reading.
+    The STAC item still carried the grid definition, so use it in this order:
+    asset proj:epsg / proj:code / proj:wkt2 / proj:projjson, then the same keys on
+    the item. A raster whose CRS is present is returned unchanged, so every
+    existing read is byte-identical."""
+    crs = getattr(src, "crs", None)
+    if crs:
+        return crs
+    sources = []
+    if item is not None and band_key:
+        assets = getattr(item, "assets", {}) or {}
+        asset = assets.get(band_key) if hasattr(assets, "get") else None
+        if asset is not None:
+            sources.append(getattr(asset, "extra_fields", None) or {})
+        sources.append(getattr(item, "properties", None) or {})
+    for props in sources:
+        epsg = props.get("proj:epsg")
+        if epsg:
+            return CRS.from_epsg(int(epsg))
+        code = props.get("proj:code")
+        if code:
+            return CRS.from_user_input(str(code))
+        wkt = props.get("proj:wkt2")
+        if wkt:
+            return CRS.from_wkt(str(wkt))
+        projjson = props.get("proj:projjson")
+        if projjson:
+            return CRS.from_user_input(projjson)
+    raise ValueError(
+        f"raster for band {band_key or '?'} of {getattr(item, 'id', '?')} has no CRS "
+        f"and the STAC item carries no proj:epsg/proj:code/proj:wkt2"
+    )
 
 
 def utm_crs_for(geom):
@@ -196,11 +266,29 @@ def to_reflectance(data: np.ndarray, item, band_key: str) -> np.ndarray:
 # BAND READ
 # ---------------------------------------------------------------------------
 def read_band(item, band_key: str, geometry, reference=None, categorical=False):
+    """Every remote Sentinel-2 raster read in the pipeline goes through here -
+    processor, parcel context, water layers and the block-path fallback. So
+    this is the one place where counting is COMPLETE by construction: the
+    canary's raster_reads and throttling counters cannot miss a stage.
+    (release-audit finding: counters in individual stages undercounted.)"""
+    from resource_budget import COUNTERS
+    try:
+        out = _read_band_impl(item, band_key, geometry, reference=reference,
+                              categorical=categorical)
+    except Exception as exc:
+        COUNTERS.classify_read_error(exc)
+        raise
+    COUNTERS.bump("raster_reads")
+    return out
+
+
+def _read_band_impl(item, band_key: str, geometry, reference=None, categorical=False):
     """Read a band clipped to geometry and optionally reproject to reference."""
     asset = item.assets[band_key]
 
     with rasterio.open(asset.href) as src:
-        geom_proj = reproject_geometry(geometry, src.crs)
+        src_crs = source_crs(src, item, band_key)
+        geom_proj = reproject_geometry(geometry, src_crs)
         nodata = src.nodata if src.nodata is not None else 0
 
         pad_m = 0.0
@@ -237,7 +325,7 @@ def read_band(item, band_key: str, geometry, reference=None, categorical=False):
             arr[~inside] = np.nan
 
         if reference is None:
-            return arr, transform, src.crs, cov
+            return arr, transform, src_crs, cov
 
         ref_shape, ref_transform, ref_crs, ref_coverage = reference
         ref_footprint = ref_coverage > 0
@@ -251,7 +339,7 @@ def read_band(item, band_key: str, geometry, reference=None, categorical=False):
             dst = np.zeros(ref_shape, dtype="int16")
             reproject(
                 source=arr, destination=dst,
-                src_transform=transform, src_crs=src.crs,
+                src_transform=transform, src_crs=src_crs,
                 dst_transform=ref_transform, dst_crs=ref_crs,
                 src_nodata=0, dst_nodata=0,
                 resampling=Resampling.nearest,
@@ -260,7 +348,7 @@ def read_band(item, band_key: str, geometry, reference=None, categorical=False):
             dst = np.full(ref_shape, np.nan, dtype="float32")
             reproject(
                 source=arr, destination=dst,
-                src_transform=transform, src_crs=src.crs,
+                src_transform=transform, src_crs=src_crs,
                 dst_transform=ref_transform, dst_crs=ref_crs,
                 src_nodata=np.nan, dst_nodata=np.nan,
                 resampling=Resampling.bilinear,
