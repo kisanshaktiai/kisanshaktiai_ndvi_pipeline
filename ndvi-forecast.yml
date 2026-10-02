@@ -1,0 +1,60 @@
+name: NDVI Temporal Forecast
+
+on:
+  workflow_dispatch:
+    inputs:
+      tenant:
+        description: "Restrict to one tenant_id (optional)"
+        type: string
+        default: ""
+  # Run AFTER the NDVI pipeline finishes, not at a fixed clock time. A fixed
+  # 02:30 start assumed the 02:00 pipeline was done, but GitHub starts
+  # scheduled runs late (the 2026-09-23 pipeline started at 02:55), so the
+  # forecast could run BEFORE that night's observations existed.
+  workflow_run:
+    workflows: ["NDVI Pipeline"]
+    types: [completed]
+
+concurrency:
+  group: ndvi-temporal-forecast
+  cancel-in-progress: false
+
+jobs:
+  forecast:
+    # after the pipeline only if it succeeded; manual runs always
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+      PYTHONUNBUFFERED: "1"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Run temporal forecast
+        # pipefail: without it the step's exit code is tee's (always 0), so a
+        # crashing forecast was reported as success.
+        run: |
+          set -o pipefail
+          if [ -n "${{ github.event.inputs.tenant }}" ]; then
+            python ndvi_temporal_predictor.py --tenant "${{ github.event.inputs.tenant }}" | tee forecast.log
+          else
+            python ndvi_temporal_predictor.py | tee forecast.log
+          fi
+      - name: Upload forecast log
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: ndvi-temporal-forecast-${{ github.run_id }}
+          path: forecast.log
+          retention-days: 30
